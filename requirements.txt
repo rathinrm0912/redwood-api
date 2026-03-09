@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+groq
+pymupdf
+pytesseract==0.3.13
+pillow
+numpy
