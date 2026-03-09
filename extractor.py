@@ -322,16 +322,17 @@ Document:
     notes = parsed.get("notes", [])
 
     return ExtractResponse(
-        mapped={
-            "company_name": parsed.get("company_name", ""),
-            "period":       parsed.get("period", "Unknown"),
-            "all_periods":  all_periods,
-            "data":         clean_data,
-            "notes":        notes
-        },
-        raw=full_text[:2000],
-        confidence=item_confidence
-    )
+    mapped={
+        "companyname":  parsed.get("company_name", ""),   # ✅ fsa.js reads this
+        "period":       parsed.get("period", "Unknown"),
+        "allperiods":   all_periods,                       # ✅ fsa.js reads this
+        "data":         clean_data,
+        "notes":        notes
+    },
+    raw=full_text[:2000],
+    confidence=item_confidence
+)
+
 
 
 @app.get("/health")
