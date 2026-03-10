@@ -9,8 +9,8 @@ from groq import Groq
 import os
 import json
 from typing import Any
-from collections import defaultdict
 import re
+
 
 app = FastAPI()
 
@@ -34,6 +34,7 @@ FINANCIAL_KEYWORDS = [
 ]
 
 INDIAN_NUMBER_RE = re.compile(r'\d{1,2}(,\d{2})*,\d{3}(\.\d+)?|\d[\d,]+\.\d{2}')
+
 
 class ExtractResponse(BaseModel):
     mapped: Any
@@ -118,13 +119,10 @@ def compute_item_confidence(item_name: str, val: float, page_text: str, model_co
 
     if val and val != 0:
         score += 20
-
     if val and val > 10000:
         score += 20
-
     if item_name.lower() in page_text.lower():
         score += 20
-
     if "|" in page_text and val and val > 0:
         score += 20
 
@@ -144,7 +142,6 @@ async def extract_pdf(
     doc = fitz.open(stream=contents, filetype="pdf")
 
     full_text = ""
-    page_data = []
 
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -156,24 +153,14 @@ async def extract_pdf(
             text = pytesseract.image_to_string(img, lang='eng').strip()
 
         full_text += text + "\n"
-        page_data.append((score_page(text), text))
 
     doc.close()
 
     if not full_text.strip():
         raise HTTPException(400, "No text found. Try a clearer PDF.")
 
-    page_data.sort(key=lambda x: x[0], reverse=True)
-
-    text_for_model = ""
-    for _, text in page_data:
-        if len(text_for_model) >= 8000:
-            break
-        text_for_model += text + "\n"
-    text_for_model = text_for_model[:8000].strip()
-
-    if not text_for_model:
-        text_for_model = full_text[:8000].strip()
+    # ✅ FIX: keep document order so year headers stay with data columns
+    text_for_model = full_text[:12000].strip()
 
     pnl_sections = json.loads(pnl_schema)
     bs_sections  = json.loads(bs_schema)
@@ -264,7 +251,7 @@ Document:
         ],
         model="llama-3.3-70b-versatile",
         temperature=0,
-        max_tokens=3000,
+        max_tokens=8000,  # ✅ FIX: was 3000, too low for 2-year full extraction
         response_format={"type": "json_object"}
     )
 
@@ -322,17 +309,16 @@ Document:
     notes = parsed.get("notes", [])
 
     return ExtractResponse(
-    mapped={
-        "companyname":  parsed.get("company_name", ""),   # ✅ fsa.js reads this
-        "period":       parsed.get("period", "Unknown"),
-        "allperiods":   all_periods,                       # ✅ fsa.js reads this
-        "data":         clean_data,
-        "notes":        notes
-    },
-    raw=full_text[:2000],
-    confidence=item_confidence
-)
-
+        mapped={
+            "companyname": parsed.get("company_name", ""),
+            "period":      parsed.get("period", "Unknown"),
+            "allperiods":  all_periods,
+            "data":        clean_data,
+            "notes":       notes
+        },
+        raw=full_text[:2000],
+        confidence=item_confidence
+    )
 
 
 @app.get("/health")
@@ -361,18 +347,8 @@ async def debug_extract(file: UploadFile = File(...)):
 
     doc.close()
 
-    page_data.sort(key=lambda x: x[0], reverse=True)
-
-    text_for_model = ""
-    for _, text in page_data:
-        if len(text_for_model) >= 8000:
-            break
-        text_for_model += text + "\n"
-    text_for_model = text_for_model[:8000].strip()
-
     return {
         "full_text_length": len(full_text),
-        "text_sent_to_model_length": len(text_for_model),
-        "page_scores": [(s, t[:80]) for s, t in sorted(page_data, key=lambda x: x[0], reverse=True)],
-        "text_sent_to_model": text_for_model
+        "text_sent_to_model": full_text[:12000],
+        "page_scores": [(s, t[:80]) for s, t in sorted(page_data, key=lambda x: x[0], reverse=True)]
     }
