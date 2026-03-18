@@ -1,4 +1,3 @@
-# extractor.py — Production Final (Full Context + Structured Notes)
 import fitz
 import io
 import os
@@ -26,13 +25,13 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
 client = Groq(api_key=GROQ_API_KEY)
 
-# Context budget:
-# llama-3.3-70b context = 131,072 tokens
-# Prompt template ≈ 2,000 tokens
-# Max response = 16,000 tokens
-# Safe document budget = ~113,000 tokens ≈ 90,000 chars
-FINANCIAL_TEXT_LIMIT = 90_000   # chars sent for P&L / BS / CF extraction
-NOTES_TEXT_LIMIT     = 60_000   # chars sent for notes extraction (separate pass)
+# Context budget (Tuned strictly for Groq 12,000 TPM Free Tier):
+# 1 Token ≈ 4 characters.
+# max_tokens for response = 4000
+# Prompt schema overhead = ~1000 tokens
+# Available text budget = ~7000 tokens ≈ 28,000 characters total
+FINANCIAL_TEXT_LIMIT = 22_000   # chars sent for P&L / BS / CF extraction
+NOTES_TEXT_LIMIT     = 5_000    # chars sent for notes extraction
 
 FINANCIAL_KEYWORDS = [
     "revenue", "income", "expenditure", "expenses", "profit", "loss",
@@ -107,8 +106,6 @@ def extract_page_text_structured(page) -> str:
 def score_financial_page(text: str) -> int:
     """
     Scores a page for P&L / BS / Cash Flow relevance.
-    High numbers + pipe separators + financial keywords = high score.
-    Text-heavy pages (director reports, legal text) are penalised.
     """
     score = 0
     lower = text.lower()
@@ -139,7 +136,6 @@ def score_financial_page(text: str) -> int:
 def score_notes_page(text: str) -> int:
     """
     Scores a page for Notes to Accounts relevance.
-    Looks for note numbers, accounting policy language, and smaller tables.
     """
     score = 0
     lower = text.lower()
@@ -158,7 +154,7 @@ def score_notes_page(text: str) -> int:
     score += len(INDIAN_NUMBER_RE.findall(text)) * 2
     score += text.count("|") * 2
 
-    # Penalise purely numeric pages (those are financial statements, not notes)
+    # Penalise purely numeric pages
     words     = len(text.split())
     num_count = len(re.findall(r'\d+', text))
     if words > 30 and (num_count / words) > 0.5:
@@ -171,7 +167,7 @@ def score_notes_page(text: str) -> int:
 def select_pages(page_texts: list, scorer_fn, char_limit: int, top_n: int = 20) -> str:
     """
     Score all pages with scorer_fn, take top_n,
-    re-sort them into document order (so year headers stay with data),
+    re-sort them into document order,
     then fill up to char_limit.
     """
     scored = []
@@ -180,11 +176,8 @@ def select_pages(page_texts: list, scorer_fn, char_limit: int, top_n: int = 20) 
         if score > 0:
             scored.append((score, page_num, text))
 
-    # Take top N by score
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:top_n]
-
-    # Restore document order so column headers stay above their data
     top.sort(key=lambda x: x[1])
 
     result = ""
@@ -200,9 +193,6 @@ def select_pages(page_texts: list, scorer_fn, char_limit: int, top_n: int = 20) 
 
 
 # ── CONFIDENCE SCORER ─────────────────────────────────────────────
-# Raw 0-100 only — no threshold logic here.
-# Frontend reads confidenceThresholds from Firestore (engineConfig)
-# to decide green / amber / red colours in the import modal.
 def compute_item_confidence(
     item_name: str, val: float, full_text: str, model_conf: dict
 ) -> int:
@@ -219,7 +209,6 @@ def compute_item_confidence(
     if val and val != 0:    score += 20
     if val and abs(val) > 10000: score += 20
 
-    # Check against FULL raw text (before any truncation) for accuracy
     if item_name.lower() in full_text.lower(): score += 40
 
     return min(score, 100)
@@ -269,18 +258,14 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
         raise HTTPException(400, "No extractable text found in PDF.")
 
     # ── Two-pass smart selection ──────────────────────────────────
-    # Pass 1: best pages for financial statement data (P&L, BS, CF)
     financial_text = select_pages(
         page_texts, score_financial_page,
-        char_limit=FINANCIAL_TEXT_LIMIT, top_n=25
+        char_limit=FINANCIAL_TEXT_LIMIT, top_n=10
     )
 
-    # Pass 2: best pages for Notes to Accounts
-    # Notes pages are DIFFERENT from financial statement pages —
-    # they're text-heavy with smaller tables, note numbers, policies
     notes_text = select_pages(
         page_texts, score_notes_page,
-        char_limit=NOTES_TEXT_LIMIT, top_n=20
+        char_limit=NOTES_TEXT_LIMIT, top_n=5
     )
 
     doc_keys_list = list(doc_schemas.keys())
@@ -294,9 +279,6 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
         schema_desc += f'\n{doc_key.upper()} section keys:\n{desc}\n'
         data_hint   += f'    "{doc_key}": {{ "section_key": {{ "FY2024": {{ "Line Item": 1234.00 }} }} }},\n'
 
-    # ── Single large API call — financial data + notes together ───
-    # We pass both financial_text and notes_text in one prompt
-    # to avoid two separate Groq calls (saves latency + tokens)
     prompt = f"""You are a senior financial analyst extraction engine specialising in Indian statutory audit reports (Schedule III format).
 
 The document text has been extracted with table columns separated by " | ".
@@ -341,17 +323,10 @@ Extraction Rules:
    - "-", blank, "Nil" → 0
    - Read each year column independently — NEVER copy a value to both years
    - Remove all commas: "1,26,44,429.00" → 12644429.00. All positive floats.
-3. NOTES TO ACCOUNTS (notes_to_accounts array):
-   - Extract EVERY numbered note (Note 1, Note 2, etc.) and named schedule
-   - "number": the note number as a string ("1", "2", "2a" etc.)
-   - "title": the heading of the note (e.g. "Property, Plant & Equipment")
-   - "text": any accounting policy text or qualitative explanation (empty string if none)
-   - "table": array of line items in that note with per-year values
-     - Each object: {{ "item": "line item name", "FY2024": 0.0, "FY2023": 0.0 }}
-     - If a note has no table → "table": []
-   - Include ALL notes found — do not skip any
-4. CONFIDENCE: self-score 0-100 per financial item. 90-100=directly readable, 60-89=inferred.
-5. Return ONLY the JSON. No markdown, no explanation."""
+3. NOTES TO ACCOUNTS:
+   - Extract numbered notes and tables.
+4. CONFIDENCE: self-score 0-100 per financial item.
+5. Return ONLY the JSON. No markdown."""
 
     try:
         response = client.chat.completions.create(
@@ -364,7 +339,7 @@ Extraction Rules:
             ],
             model="llama-3.3-70b-versatile",
             temperature=0,
-            max_tokens=16000,       # Increased — notes can be large
+            max_tokens=4000,       # FIXED: Safely caps at 4000 to fit under the 12,000 TPM Groq Free limit
             response_format={"type": "json_object"}
         )
         parsed = json.loads(response.choices[0].message.content)
@@ -474,8 +449,8 @@ async def debug_extract(file: UploadFile = File(...)):
             "preview":         text[:120]
         })
 
-    fin_text   = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, 25)
-    notes_text = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     20)
+    fin_text   = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, 10)
+    notes_text = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     5)
     pdf_doc.close()
 
     return {
