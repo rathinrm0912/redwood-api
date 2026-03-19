@@ -1,5 +1,4 @@
-# extractor.py — Redwood Production Final
-# Fixes: regex, page scoring, large PDF support, GitHub Models (no TPM limits)
+# extractor.py — Redwood Production Final v3
 
 import fitz
 import io
@@ -9,7 +8,7 @@ import json
 import pytesseract
 from PIL import Image
 from openai import OpenAI
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
@@ -54,10 +53,22 @@ NOTES_KEYWORDS = [
 INDIAN_NUMBER_RE = re.compile(r'\d{1,2}(,\d{2})*,\d{3}(\.\d+)?|\d[\d,]+\.\d{2}')
 
 
-class ExtractResponse(BaseModel):
-    mapped: Any
-    raw: str
-    confidence: Any
+# ── UNIFORM .00 SERIALIZER ────────────────────────────────────────
+def financial_json_response(data) -> Response:
+    """All floats serialized with exactly 2 decimal places: 12644429.00"""
+    def preprocess(obj):
+        if isinstance(obj, float):
+            return f"§{obj:.2f}§"
+        if isinstance(obj, dict):
+            return {k: preprocess(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [preprocess(i) for i in obj]
+        return obj
+
+    processed = preprocess(data)
+    raw       = json.dumps(processed, ensure_ascii=False)
+    raw       = re.sub(r'"§(-?[\d.]+)§"', r'\1', raw)
+    return Response(content=raw, media_type="application/json")
 
 
 # ── TEXT EXTRACTION ───────────────────────────────────────────────
@@ -107,25 +118,44 @@ def extract_page_text_structured(page) -> str:
 def score_financial_page(text: str) -> int:
     score = 0
     lower = text.lower()
+    lines = text.split('\n')
 
-    score += len(INDIAN_NUMBER_RE.findall(text)) * 4
-    score += len(re.findall(r'\d[\d,]{4,}', text)) * 2
+    score += len(INDIAN_NUMBER_RE.findall(text)) * 6
+    score += len(re.findall(r'\d[\d,]{4,}', text)) * 3
 
     for kw in FINANCIAL_KEYWORDS:
         if kw in lower:
             score += 3
 
-    score += text.count("|") * 3
+    # Only count pipes on lines that ALSO have numbers (real table rows)
+    # Prevents OCR prose pages (every word separated by |) from scoring high
+    numeric_pipe_lines = sum(
+        1 for l in lines if '|' in l and re.search(r'\d{2,}', l)
+    )
+    score += numeric_pipe_lines * 5
+
+    # Lines with 2+ large numbers = strong table data signal
+    multi_num_lines = sum(
+        1 for l in lines if len(re.findall(r'\d{4,}', l)) >= 2
+    )
+    score += multi_num_lines * 10
 
     year_hits = re.findall(
         r'(FY\s*\d{2,4}|20\d{2}[-\u2013]\d{2,4}|31[.\-/]\d{2}[.\-/]\d{2,4})', text
     )
     score += len(year_hits) * 5
 
-    words     = len(text.split())
-    num_count = len(re.findall(r'\d+', text))
+    words      = len(text.split())
+    num_count  = len(re.findall(r'\d+', text))
+    pipe_count = text.count('|')
+
+    # Strong prose penalty
     if words > 80 and (num_count / max(words, 1)) < 0.05:
-        score = int(score * 0.3)
+        score = int(score * 0.15)
+
+    # OCR prose penalty: many pipes but almost no numbers between them
+    if pipe_count > 20 and (num_count / max(pipe_count, 1)) < 0.1:
+        score = int(score * 0.2)
 
     return score
 
@@ -133,6 +163,7 @@ def score_financial_page(text: str) -> int:
 def score_notes_page(text: str) -> int:
     score = 0
     lower = text.lower()
+    lines = text.split('\n')
 
     for kw in NOTES_KEYWORDS:
         if kw in lower:
@@ -145,12 +176,21 @@ def score_notes_page(text: str) -> int:
     score += len(note_hits) * 8
 
     score += len(INDIAN_NUMBER_RE.findall(text)) * 2
-    score += text.count("|") * 2
 
-    words     = len(text.split())
-    num_count = len(re.findall(r'\d+', text))
+    numeric_pipe_lines = sum(
+        1 for l in lines if '|' in l and re.search(r'\d{2,}', l)
+    )
+    score += numeric_pipe_lines * 3
+
+    words      = len(text.split())
+    num_count  = len(re.findall(r'\d+', text))
+    pipe_count = text.count('|')
+
     if words > 30 and (num_count / max(words, 1)) > 0.5:
         score = int(score * 0.4)
+
+    if pipe_count > 20 and (num_count / max(pipe_count, 1)) < 0.1:
+        score = int(score * 0.25)
 
     return score
 
@@ -163,24 +203,27 @@ def select_pages(page_texts: list, scorer_fn, char_limit: int) -> str:
     scored = []
     for page_num, text in enumerate(page_texts):
         score = scorer_fn(text)
-        if score > 0:
-            scored.append((score, page_num, text))
-
-    # Fallback: if fewer than 3 pages scored, use second half positionally
-    if len(scored) < 3:
-        start = max(0, total_pages // 3)
-        scored = [
-            (1, i, page_texts[i])
-            for i in range(start, total_pages)
-            if page_texts[i].strip()
-        ]
-        if not scored:
-            scored = [(1, i, page_texts[i]) for i in range(total_pages) if page_texts[i].strip()]
+        scored.append((score, page_num, text))
+        print(f"  Page {page_num+1}: score={score}, chars={len(text)}, preview={text[:60].strip()!r}")
 
     scored.sort(key=lambda x: x[0], reverse=True)
+
+    print(f"\n🏆 Top 5 for {scorer_fn.__name__}:")
+    for score, pnum, txt in scored[:5]:
+        print(f"  Page {pnum+1} → score={score} | {txt[:80].strip()!r}")
+
+    useful = [s for s in scored if s[0] > 0]
+    if len(useful) < 3:
+        print(f"⚠️  Only {len(useful)} pages scored > 0, using positional fallback")
+        start  = max(0, total_pages // 3)
+        scored = [(1, i, page_texts[i]) for i in range(start, total_pages) if page_texts[i].strip()]
+        if not scored:
+            scored = [(1, i, page_texts[i]) for i in range(total_pages) if page_texts[i].strip()]
+        scored.sort(key=lambda x: x[0], reverse=True)
+
     top = scored[:top_n]
 
-    # Window padding: include preceding page for split header/data pages
+    # Window padding: include preceding page (header rows often split from data)
     top_indices = set(p[1] for p in top)
     for _, page_num, _ in list(top):
         if page_num > 0 and (page_num - 1) not in top_indices:
@@ -192,7 +235,7 @@ def select_pages(page_texts: list, scorer_fn, char_limit: int) -> str:
     top.sort(key=lambda x: x[1])
 
     result = ""
-    for _, _, text in top:
+    for _, pnum, text in top:
         if len(result) + len(text) + 1 <= char_limit:
             result += text + "\n"
         else:
@@ -201,6 +244,7 @@ def select_pages(page_texts: list, scorer_fn, char_limit: int) -> str:
                 result += text[:remaining] + "\n"
             continue
 
+    print(f"\n📄 {scorer_fn.__name__}: {len(top)} pages → {len(result)} chars")
     return result.strip()
 
 
@@ -227,7 +271,7 @@ def compute_item_confidence(
 
 
 # ── MAIN EXTRACT ENDPOINT ─────────────────────────────────────────
-@app.post("/extract", response_model=ExtractResponse)
+@app.post("/extract")
 async def extract_pdf(request: Request, file: UploadFile = File(...)):
     if not file.filename.endswith('.pdf'):
         raise HTTPException(400, "Only PDF files allowed")
@@ -248,6 +292,10 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
             "bs":  [{"key": "currentAssets", "title": "Current Assets"}]
         }
 
+    print(f"\n{'='*60}")
+    print(f"📥 Extracting: {file.filename}")
+    print(f"📋 Schemas: {list(doc_schemas.keys())}")
+
     contents   = await file.read()
     pdf_doc    = fitz.open(stream=contents, filetype="pdf")
     page_texts = []
@@ -256,24 +304,34 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
         page = pdf_doc[page_num]
         text = extract_page_text_structured(page)
         if not text.strip():
+            print(f"  Page {page_num+1}: no text, running OCR...")
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             img = Image.open(io.BytesIO(pix.tobytes("png")))
             text = pytesseract.image_to_string(img, lang='eng').strip()
         page_texts.append(text)
 
     pdf_doc.close()
+    print(f"✅ {len(page_texts)} pages extracted")
 
     full_text = "\n".join(page_texts)
     if not full_text.strip():
         raise HTTPException(400, "No extractable text found in PDF.")
 
+    print("\n🔍 Scoring financial pages...")
     financial_text = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT)
-    notes_text     = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT)
+
+    print("\n🔍 Scoring notes pages...")
+    notes_text = select_pages(page_texts, score_notes_page, NOTES_TEXT_LIMIT)
 
     if not financial_text.strip():
+        print("⚠️  financial_text empty — using raw fallback")
         financial_text = full_text[:FINANCIAL_TEXT_LIMIT]
     if not notes_text.strip():
+        print("⚠️  notes_text empty — using raw fallback")
         notes_text = full_text[:NOTES_TEXT_LIMIT]
+
+    print(f"\n📊 Financial: {len(financial_text)} chars | Notes: {len(notes_text)} chars")
+    print(f"Financial preview:\n{financial_text[:400]}\n")
 
     doc_keys_list = list(doc_schemas.keys())
     doc_keys_json = json.dumps(doc_keys_list)
@@ -283,7 +341,7 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
     for doc_key, sections in doc_schemas.items():
         desc = "\n".join([f'  "{s["key"]}": {s["title"]}' for s in sections])
         schema_desc += f'\n{doc_key.upper()} section keys:\n{desc}\n'
-        data_hint   += f'    "{doc_key}": {{ "section_key": {{ "FY2024": {{ "Line Item": 1234.00 }} }} }},\n'
+        data_hint   += f'    "{doc_key}": {{ "section_key": {{ "FY2016": {{ "Line Item": 1234.00 }} }} }},\n'
 
     # ── CALL 1 — Financial Data ───────────────────────────────────
     fin_prompt = f"""You are a senior financial analyst extraction engine specialising in Indian statutory audit reports (Schedule III format).
@@ -295,8 +353,8 @@ Return ONLY valid JSON:
 
 {{
   "company_name": "string",
-  "period": "FY2024",
-  "all_periods": ["FY2024", "FY2023"],
+  "period": "FY2016",
+  "all_periods": ["FY2016", "FY2015"],
   "confidence": {{ "Exact Item Name": 95 }},
   "data": {{
 {data_hint}  }}
@@ -307,27 +365,25 @@ The "data" object MUST contain keys for: {doc_keys_json}
 {schema_desc}
 
 Extraction Rules:
-1. YEAR DETECTION: First value column = most recent year, second = prior year. Normalise to "FY20XX".
+1. YEAR DETECTION: First value column = most recent year, second = prior year. Normalise to "FY20XX" (31.03.2016 → FY2016).
 2. Map each line item to the nearest schema section key.
 3. Read ONLY values physically in each cell — NEVER infer, carry over, or substitute.
 4. "-", blank, "Nil" → 0. All values positive floats.
 5. Remove all commas: "1,26,44,429.00" → 12644429.00
 6. Read each year column independently — NEVER copy a value to both years.
-7. Confidence: self-score 0-100 per item. 90-100=clearly readable, 60-89=inferred. Use EXACT item name string as in data.
+7. Confidence: self-score 0-100 per item. 90-100=clearly readable, 60-89=inferred.
 8. Empty sections → {{}}
 9. Return ONLY the JSON. No markdown. No explanation.
 
 Document:
 {financial_text}"""
 
+    print("\n🤖 Calling GPT-4o-mini — financial data...")
     try:
         fin_response = client.chat.completions.create(
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a strict financial OCR parser for Indian statutory reports. Extract only explicitly present values. Return only valid JSON."
-                },
-                {"role": "user", "content": fin_prompt}
+                {"role": "system", "content": "You are a strict financial OCR parser for Indian statutory reports. Extract only explicitly present values. Return only valid JSON."},
+                {"role": "user",   "content": fin_prompt}
             ],
             model=MODEL,
             temperature=0,
@@ -335,7 +391,13 @@ Document:
             response_format={"type": "json_object"}
         )
         fin_parsed = json.loads(fin_response.choices[0].message.content)
+        print(f"✅ Financial done. Company: {fin_parsed.get('company_name')}, Period: {fin_parsed.get('period')}")
+        for dk, dv in fin_parsed.get('data', {}).items():
+            for sk, sv in dv.items():
+                total = sum(len(v) for v in sv.values() if isinstance(v, dict))
+                print(f"   {dk}.{sk}: {total} items across {list(sv.keys())}")
     except Exception as e:
+        print(f"❌ Financial error: {e}")
         raise HTTPException(500, f"Financial extraction error: {str(e)}")
 
     # ── CALL 2 — Notes to Accounts ────────────────────────────────
@@ -351,35 +413,34 @@ Return ONLY valid JSON:
     {{
       "number": "1",
       "title": "Note Title",
-      "text": "Any accounting policy or qualitative text. Empty string if none.",
+      "text": "Accounting policy or qualitative text. Empty string if none.",
       "table": [
-        {{ "item": "Sub-item name", "FY2024": 1234.00, "FY2023": 1000.00 }}
+        {{ "item": "Sub-item name", "FY2016": 1234.00, "FY2015": 1000.00 }}
       ]
     }}
   ]
 }}
 
 Rules:
-- Extract EVERY numbered note and named schedule found in the document
-- "number": note number as string ("1", "2", "2a", etc.)
-- "title": the heading of the note
-- "text": policy or qualitative explanation — empty string if none
-- "table": array of line items with per-year values. [] if the note has no table.
-- Remove all commas from numbers: "1,26,44,429.00" → 12644429.00
-- Use "FY20XX" format for all year keys
+- Extract EVERY numbered financial note (Share Capital, Reserves, Fixed Assets, etc.)
+- Do NOT extract auditor report sections, legal annexures, or compliance paragraphs
+- "number": note number as string ("1", "2a", etc.)
+- "title": heading of the note
+- "text": policy/qualitative explanation — empty string if none
+- "table": line items with per-year values. [] if no table.
+- Remove all commas: "1,26,44,429.00" → 12644429.00
+- Use "FY20XX" format for all year keys (31.03.2016 → FY2016)
 - Return ONLY the JSON. No markdown. No explanation.
 
 Document:
 {notes_text}"""
 
+        print("\n🤖 Calling GPT-4o-mini — notes...")
         try:
             notes_response = client.chat.completions.create(
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a strict financial notes extractor. Return only valid JSON."
-                    },
-                    {"role": "user", "content": notes_prompt}
+                    {"role": "system", "content": "You are a strict financial notes extractor. Return only valid JSON."},
+                    {"role": "user",   "content": notes_prompt}
                 ],
                 model=MODEL,
                 temperature=0,
@@ -387,17 +448,19 @@ Document:
                 response_format={"type": "json_object"}
             )
             notes_parsed = json.loads(notes_response.choices[0].message.content)
+            print(f"✅ Notes done: {len(notes_parsed.get('notes_to_accounts', []))} notes extracted")
         except Exception as e:
-            print(f"Notes extraction failed (non-fatal): {str(e)}")
+            print(f"⚠️  Notes failed (non-fatal): {e}")
             notes_parsed = {"notes_to_accounts": []}
 
-    # ── Clean numeric values ──────────────────────────────────────
+    # ── Clean values ──────────────────────────────────────────────
     def clean_val(v):
         try:
-            return float(str(v).replace(',', '').replace(' ', '').strip())
+            return round(float(str(v).replace(',', '').replace(' ', '').strip()), 2)
         except Exception:
-            return 0.0
+            return 0.00
 
+    # ── Process financial data ────────────────────────────────────
     raw_data   = fin_parsed.get("data", {})
     final_data = {}
 
@@ -412,6 +475,7 @@ Document:
                             k: clean_val(v) for k, v in items.items()
                         }
 
+    # ── Process notes ─────────────────────────────────────────────
     raw_notes   = notes_parsed.get("notes_to_accounts", [])
     clean_notes = []
 
@@ -430,6 +494,7 @@ Document:
             "table":  clean_table
         })
 
+    # ── Confidence ────────────────────────────────────────────────
     raw_conf        = fin_parsed.get("confidence", {})
     item_confidence = {}
 
@@ -442,17 +507,23 @@ Document:
                             item_name, item_val, full_text, raw_conf
                         )
 
-    return ExtractResponse(
-        mapped={
+    print(f"\n✅ Final:")
+    for dk, dv in final_data.items():
+        for sk, sv in dv.items():
+            for period, items in sv.items():
+                print(f"   {dk}.{sk}.{period}: {len(items)} items")
+
+    return financial_json_response({
+        "mapped": {
             "companyname":       fin_parsed.get("company_name", "Unknown"),
             "period":            fin_parsed.get("period", "Unknown"),
             "allperiods":        fin_parsed.get("all_periods", [fin_parsed.get("period", "Unknown")]),
             "data":              final_data,
             "notes_to_accounts": clean_notes,
         },
-        raw=full_text[:3000],
-        confidence=item_confidence
-    )
+        "raw":        full_text[:3000],
+        "confidence": item_confidence
+    })
 
 
 # ── HEALTH & DEBUG ────────────────────────────────────────────────
