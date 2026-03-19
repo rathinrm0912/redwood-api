@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
 from typing import Any
-
+ 
 app = FastAPI()
 
 app.add_middleware(
