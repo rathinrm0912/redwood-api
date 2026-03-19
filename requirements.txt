@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 openai
-pymupdf
+pymupdf 
 pytesseract==0.3.13
 pillow
 numpy
