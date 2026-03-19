@@ -1,4 +1,6 @@
-# extractor.py — Production Final (Free Tier Safe, Two-Pass, Full Notes)
+# extractor.py — Redwood Production Final
+# Fixes: regex, page scoring, large PDF support, GitHub Models (no TPM limits)
+
 import fitz
 import io
 import os
@@ -6,7 +8,7 @@ import re
 import json
 import pytesseract
 from PIL import Image
-from groq import Groq
+from openai import OpenAI
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import HTTPException
@@ -23,12 +25,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
-client = Groq(api_key=GROQ_API_KEY)
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+client = OpenAI(
+    base_url="https://models.inference.ai.azure.com",
+    api_key=GITHUB_TOKEN,
+)
+MODEL = "gpt-4o-mini"
 
-# ── TOKEN BUDGET (Groq free tier = 12,000 TPM hard limit) ────────
-# Call 1 (financial): 24,000 chars ≈ 6,000 tokens input + 4,000 output = 10,000 ✅
-# Call 2 (notes):     18,000 chars ≈ 4,500 tokens input + 4,000 output =  8,500 ✅
 FINANCIAL_TEXT_LIMIT = 24_000
 NOTES_TEXT_LIMIT     = 18_000
 
@@ -59,7 +62,6 @@ class ExtractResponse(BaseModel):
 
 # ── TEXT EXTRACTION ───────────────────────────────────────────────
 def extract_page_text_structured(page) -> str:
-    """Coordinate-sorted extraction — preserves table column alignment."""
     try:
         raw_dict  = page.get_text("dict")
         all_spans = []
@@ -103,8 +105,6 @@ def extract_page_text_structured(page) -> str:
 
 # ── PAGE SCORERS ──────────────────────────────────────────────────
 def score_financial_page(text: str) -> int:
-    """High numbers + pipe separators + financial keywords = high score.
-    Text-heavy pages (director reports, legal notices) are penalised."""
     score = 0
     lower = text.lower()
 
@@ -118,21 +118,19 @@ def score_financial_page(text: str) -> int:
     score += text.count("|") * 3
 
     year_hits = re.findall(
-        r'(FY\s*\d{2,4}|20\d{2}[-–]\d{2,4}|31[.\-/]\d{2}[.\-/]\d{2,4})', text
+        r'(FY\s*\d{2,4}|20\d{2}[-\u2013]\d{2,4}|31[.\-/]\d{2}[.\-/]\d{2,4})', text
     )
     score += len(year_hits) * 5
 
-    # Penalise prose-heavy pages (low number density)
     words     = len(text.split())
     num_count = len(re.findall(r'\d+', text))
-    if words > 80 and (num_count / words) < 0.05:
+    if words > 80 and (num_count / max(words, 1)) < 0.05:
         score = int(score * 0.3)
 
     return score
 
 
 def score_notes_page(text: str) -> int:
-    """Notes pages have note numbers, policy language, and smaller tables."""
     score = 0
     lower = text.lower()
 
@@ -149,47 +147,64 @@ def score_notes_page(text: str) -> int:
     score += len(INDIAN_NUMBER_RE.findall(text)) * 2
     score += text.count("|") * 2
 
-    # Penalise purely numeric pages (those are financial statements, not notes)
     words     = len(text.split())
     num_count = len(re.findall(r'\d+', text))
-    if words > 30 and (num_count / words) > 0.5:
+    if words > 30 and (num_count / max(words, 1)) > 0.5:
         score = int(score * 0.4)
 
     return score
 
 
 # ── SMART PAGE SELECTOR ───────────────────────────────────────────
-def select_pages(page_texts: list, scorer_fn, char_limit: int, top_n: int = 20) -> str:
-    """
-    Score all pages, take top N, re-sort into document order
-    (so year headers stay above their data columns), fill to char_limit.
-    """
+def select_pages(page_texts: list, scorer_fn, char_limit: int) -> str:
+    total_pages = len(page_texts)
+    top_n       = max(20, total_pages // 5)
+
     scored = []
     for page_num, text in enumerate(page_texts):
         score = scorer_fn(text)
         if score > 0:
             scored.append((score, page_num, text))
 
+    # Fallback: if fewer than 3 pages scored, use second half positionally
+    if len(scored) < 3:
+        start = max(0, total_pages // 3)
+        scored = [
+            (1, i, page_texts[i])
+            for i in range(start, total_pages)
+            if page_texts[i].strip()
+        ]
+        if not scored:
+            scored = [(1, i, page_texts[i]) for i in range(total_pages) if page_texts[i].strip()]
+
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:top_n]
-    top.sort(key=lambda x: x[1])   # restore document order
+
+    # Window padding: include preceding page for split header/data pages
+    top_indices = set(p[1] for p in top)
+    for _, page_num, _ in list(top):
+        if page_num > 0 and (page_num - 1) not in top_indices:
+            prev_text = page_texts[page_num - 1]
+            if prev_text.strip():
+                top.append((0, page_num - 1, prev_text))
+                top_indices.add(page_num - 1)
+
+    top.sort(key=lambda x: x[1])
 
     result = ""
     for _, _, text in top:
-        if len(result) + len(text) + 1 > char_limit:
+        if len(result) + len(text) + 1 <= char_limit:
+            result += text + "\n"
+        else:
             remaining = char_limit - len(result)
-            if remaining > 800:
+            if remaining > 200:
                 result += text[:remaining] + "\n"
-            break
-        result += text + "\n"
+            continue
 
     return result.strip()
 
 
 # ── CONFIDENCE SCORER ─────────────────────────────────────────────
-# Returns raw 0-100 scores only.
-# Frontend reads confidenceThresholds from Firestore to decide
-# green / amber / red colours in the import modal.
 def compute_item_confidence(
     item_name: str, val: float, full_text: str, model_conf: dict
 ) -> int:
@@ -206,7 +221,6 @@ def compute_item_confidence(
     if val and val != 0:         score += 20
     if val and abs(val) > 10000: score += 20
 
-    # Check against full raw text (before any truncation)
     if item_name.lower() in full_text.lower(): score += 40
 
     return min(score, 100)
@@ -218,8 +232,6 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
     if not file.filename.endswith('.pdf'):
         raise HTTPException(400, "Only PDF files allowed")
 
-    # ── Parse ALL *_schema form fields dynamically ────────────────
-    # Frontend sends: pnl_schema, bs_schema, cashflow_schema, etc.
     form_data   = await request.form()
     doc_schemas = {}
     for field_name, field_value in form_data.items():
@@ -236,7 +248,6 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
             "bs":  [{"key": "currentAssets", "title": "Current Assets"}]
         }
 
-    # ── Extract all page texts ────────────────────────────────────
     contents   = await file.read()
     pdf_doc    = fitz.open(stream=contents, filetype="pdf")
     page_texts = []
@@ -256,11 +267,14 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
     if not full_text.strip():
         raise HTTPException(400, "No extractable text found in PDF.")
 
-    # ── Smart page selection — two separate passes ────────────────
-    financial_text = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, top_n=15)
-    notes_text     = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     top_n=12)
+    financial_text = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT)
+    notes_text     = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT)
 
-    # ── Build dynamic schema sections for prompt ──────────────────
+    if not financial_text.strip():
+        financial_text = full_text[:FINANCIAL_TEXT_LIMIT]
+    if not notes_text.strip():
+        notes_text = full_text[:NOTES_TEXT_LIMIT]
+
     doc_keys_list = list(doc_schemas.keys())
     doc_keys_json = json.dumps(doc_keys_list)
     schema_desc   = ""
@@ -271,8 +285,7 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
         schema_desc += f'\n{doc_key.upper()} section keys:\n{desc}\n'
         data_hint   += f'    "{doc_key}": {{ "section_key": {{ "FY2024": {{ "Line Item": 1234.00 }} }} }},\n'
 
-    # ── CALL 1 — Financial Data (P&L, BS, Cash Flow) ──────────────
-    # Budget: ~6,000 input tokens + 4,000 output = 10,000 (under 12k limit)
+    # ── CALL 1 — Financial Data ───────────────────────────────────
     fin_prompt = f"""You are a senior financial analyst extraction engine specialising in Indian statutory audit reports (Schedule III format).
 
 The document text has been extracted with table columns separated by " | ".
@@ -294,7 +307,7 @@ The "data" object MUST contain keys for: {doc_keys_json}
 {schema_desc}
 
 Extraction Rules:
-1. YEAR DETECTION: First value column = most recent year, second = prior year. Normalise → "FY20XX".
+1. YEAR DETECTION: First value column = most recent year, second = prior year. Normalise to "FY20XX".
 2. Map each line item to the nearest schema section key.
 3. Read ONLY values physically in each cell — NEVER infer, carry over, or substitute.
 4. "-", blank, "Nil" → 0. All values positive floats.
@@ -316,7 +329,7 @@ Document:
                 },
                 {"role": "user", "content": fin_prompt}
             ],
-            model="llama-3.3-70b-versatile",
+            model=MODEL,
             temperature=0,
             max_tokens=4000,
             response_format={"type": "json_object"}
@@ -326,8 +339,6 @@ Document:
         raise HTTPException(500, f"Financial extraction error: {str(e)}")
 
     # ── CALL 2 — Notes to Accounts ────────────────────────────────
-    # Budget: ~4,500 input tokens + 4,000 output = 8,500 (under 12k limit)
-    # Non-fatal — if this fails, financial data still returns cleanly
     notes_parsed = {"notes_to_accounts": []}
 
     if notes_text.strip():
@@ -370,7 +381,7 @@ Document:
                     },
                     {"role": "user", "content": notes_prompt}
                 ],
-                model="llama-3.3-70b-versatile",
+                model=MODEL,
                 temperature=0,
                 max_tokens=4000,
                 response_format={"type": "json_object"}
@@ -387,7 +398,6 @@ Document:
         except Exception:
             return 0.0
 
-    # ── Process all financial doc types dynamically ───────────────
     raw_data   = fin_parsed.get("data", {})
     final_data = {}
 
@@ -402,7 +412,6 @@ Document:
                             k: clean_val(v) for k, v in items.items()
                         }
 
-    # ── Clean notes_to_accounts ───────────────────────────────────
     raw_notes   = notes_parsed.get("notes_to_accounts", [])
     clean_notes = []
 
@@ -421,7 +430,6 @@ Document:
             "table":  clean_table
         })
 
-    # ── Confidence scores (raw, no threshold logic) ───────────────
     raw_conf        = fin_parsed.get("confidence", {})
     item_confidence = {}
 
@@ -454,7 +462,7 @@ def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "llama-3.3-70b-versatile", "tier": "free-12k-tpm-safe"}
+    return {"status": "ok", "model": MODEL, "provider": "github-models"}
 
 @app.get("/ping")
 def ping():
@@ -483,8 +491,8 @@ async def debug_extract(file: UploadFile = File(...)):
             "preview":         text[:120]
         })
 
-    fin_text   = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, 15)
-    notes_text = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     12)
+    fin_text   = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT)
+    notes_text = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT)
     pdf_doc.close()
 
     return {
