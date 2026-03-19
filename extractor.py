@@ -1,4 +1,4 @@
-# extractor.py — Redwood Production (Groq) — Fixed: 413 limit, .00 formatting, company name
+# extractor.py — Redwood Production (Groq) — Fixed: 413, .00 formatting, company name
 
 import fitz
 import io
@@ -27,16 +27,15 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
 client = Groq(api_key=GROQ_API_KEY)
 
-# ── TOKEN BUDGET (Groq Free Tier = 12,000 TPM) ───────────────────
-# Total request = input tokens + output tokens
-# Output reserved  = 4,000 tokens
-# Input budget      = 8,000 tokens
-# Overhead (system + schema + instructions) ≈ 2,000 tokens
-# Safe text budget  = 6,000 tokens ≈ 24,000 chars combined
-# Split: 80% financial, 20% notes
-FINANCIAL_TEXT_LIMIT = 16_000   # ~4,000 tokens
-NOTES_TEXT_LIMIT     =  4_000   # ~1,000 tokens
-MAX_COMBINED_CHARS   = 20_000   # hard safety cap
+# Groq Free Tier = 12,000 TPM hard limit
+# Output reserved = 4,000 tokens (~16,000 chars)
+# Input budget    = 8,000 tokens
+# Overhead        = ~2,000 tokens (system + schema + instructions)
+# Safe text chars = ~6,000 tokens = ~24,000 chars total
+# Split: 80% financial, 20% notes, with hard cap enforced before API call
+FINANCIAL_TEXT_LIMIT = 16_000
+NOTES_TEXT_LIMIT     =  4_000
+MAX_COMBINED_CHARS   = 19_000   # hard cap — never exceed this before sending to Groq
 
 FINANCIAL_KEYWORDS = [
     "revenue", "income", "expenditure", "expenses", "profit", "loss",
@@ -59,7 +58,7 @@ INDIAN_NUMBER_RE = re.compile(r'\d{1,2}(,\d{2})*,\d{3}(\.\d+)?|\d[\d,]+\.\d{2}')
 
 # ── UNIFORM .00 SERIALIZER ────────────────────────────────────────
 def financial_json_response(data) -> Response:
-    """All floats serialized with exactly 2 decimal places: 12644429.00"""
+    """Forces all floats to serialize with exactly 2 decimal places."""
     def preprocess(obj):
         if isinstance(obj, float):
             return f"§{obj:.2f}§"
@@ -131,13 +130,13 @@ def score_financial_page(text: str) -> int:
         if kw in lower:
             score += 3
 
-    # Only pipes on lines with numbers (prevents OCR prose inflation)
+    # Only pipes on lines that also have numbers — prevents OCR prose inflation
     numeric_pipe_lines = sum(
         1 for l in lines if '|' in l and re.search(r'\d{2,}', l)
     )
     score += numeric_pipe_lines * 5
 
-    # Lines with 2+ large numbers = strong table data signal
+    # Lines with 2+ large numbers = real table data rows
     multi_num_lines = sum(
         1 for l in lines if len(re.findall(r'\d{4,}', l)) >= 2
     )
@@ -155,7 +154,7 @@ def score_financial_page(text: str) -> int:
     if words > 80 and (num_count / max(words, 1)) < 0.05:
         score = int(score * 0.15)
 
-    # Penalise OCR prose: many pipes but almost no numbers
+    # OCR prose penalty: many pipes but almost no numbers
     if pipe_count > 20 and (num_count / max(pipe_count, 1)) < 0.1:
         score = int(score * 0.2)
 
@@ -243,18 +242,13 @@ def compute_item_confidence(
     return min(score, 100)
 
 
-# ── COMPANY NAME EXTRACTOR (fallback) ────────────────────────────
+# ── COMPANY NAME FALLBACK ─────────────────────────────────────────
 def extract_company_name_fallback(full_text: str) -> str:
-    """
-    Tries to pull company name from raw text if the model returns nothing.
-    Looks for 'Limited', 'Pvt', 'LLP', 'Inc' patterns in first 2000 chars.
-    """
     candidates = re.findall(
         r'([A-Z][A-Za-z\s&,.\-]+(?:Limited|Pvt\.?\s*Ltd\.?|LLP|Inc\.?|Corporation|Enterprises|Industries|Company))',
         full_text[:2000]
     )
     if candidates:
-        # Return the longest match — most likely the full legal name
         return max(candidates, key=len).strip()
     return "Unknown Company"
 
@@ -303,12 +297,13 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
     financial_text = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, top_n=10)
     notes_text     = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     top_n=5)
 
-    # ── Hard safety cap — prevents 413 on large PDFs ─────────────
+    # ── Hard cap — prevents 413 on large PDFs ────────────────────
     combined = len(financial_text) + len(notes_text)
     if combined > MAX_COMBINED_CHARS:
-        overflow        = combined - MAX_COMBINED_CHARS
-        financial_text  = financial_text[:max(8000, len(financial_text) - overflow)]
-        notes_text      = notes_text[:min(NOTES_TEXT_LIMIT, MAX_COMBINED_CHARS - len(financial_text))]
+        fin_budget   = int(MAX_COMBINED_CHARS * 0.82)
+        notes_budget = MAX_COMBINED_CHARS - fin_budget
+        financial_text = financial_text[:fin_budget]
+        notes_text     = notes_text[:notes_budget]
 
     doc_keys_list = list(doc_schemas.keys())
     doc_keys_json = json.dumps(doc_keys_list)
@@ -498,7 +493,7 @@ async def debug_extract(file: UploadFile = File(...)):
         })
 
     fin_text   = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, 10)
-    notes_text = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     5)
+    notes_text = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,      5)
     pdf_doc.close()
 
     return {
