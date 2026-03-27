@@ -1,5 +1,4 @@
-# extractor.py — Redwood Production (Groq) — Fixed: 413, .00 formatting, company name
-
+# extractor.py — ENHANCED VERSION WITH ERROR FIXES
 import fitz
 import io
 import os
@@ -8,7 +7,7 @@ import json
 import pytesseract
 from PIL import Image
 from groq import Groq
-from fastapi import FastAPI, UploadFile, File, Request, Response
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
@@ -27,15 +26,9 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
 client = Groq(api_key=GROQ_API_KEY)
 
-# Groq Free Tier = 12,000 TPM hard limit
-# Output reserved = 4,000 tokens (~16,000 chars)
-# Input budget    = 8,000 tokens
-# Overhead        = ~2,000 tokens (system + schema + instructions)
-# Safe text chars = ~6,000 tokens = ~24,000 chars total
-# Split: 80% financial, 20% notes, with hard cap enforced before API call
-FINANCIAL_TEXT_LIMIT = 16_000
-NOTES_TEXT_LIMIT     =  4_000
-MAX_COMBINED_CHARS   = 19_000   # hard cap — never exceed this before sending to Groq
+# ── TOKEN BUDGET (Groq free tier = 12,000 TPM hard limit) ────────
+FINANCIAL_TEXT_LIMIT = 24_000
+NOTES_TEXT_LIMIT     = 18_000
 
 FINANCIAL_KEYWORDS = [
     "revenue", "income", "expenditure", "expenses", "profit", "loss",
@@ -43,7 +36,8 @@ FINANCIAL_KEYWORDS = [
     "cash", "receivable", "payable", "depreciation", "surplus",
     "fixed assets", "current assets", "borrowings", "turnover",
     "sales", "purchases", "gross", "net", "ebitda", "reserves",
-    "investments", "provisions", "creditors", "debtors", "schedule"
+    "investments", "provisions", "creditors", "debtors", "schedule",
+    "intangible", "trade receivable", "advance", "prepaid", "inventory"
 ]
 
 NOTES_KEYWORDS = [
@@ -56,26 +50,32 @@ NOTES_KEYWORDS = [
 INDIAN_NUMBER_RE = re.compile(r'\d{1,2}(,\d{2})*,\d{3}(\.\d+)?|\d[\d,]+\.\d{2}')
 
 
-# ── UNIFORM .00 SERIALIZER ────────────────────────────────────────
-def financial_json_response(data) -> Response:
-    """Forces all floats to serialize with exactly 2 decimal places."""
-    def preprocess(obj):
-        if isinstance(obj, float):
-            return f"§{obj:.2f}§"
-        if isinstance(obj, dict):
-            return {k: preprocess(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [preprocess(i) for i in obj]
-        return obj
+class ExtractResponse(BaseModel):
+    mapped: Any
+    raw: str
+    confidence: Any
 
-    processed = preprocess(data)
-    raw       = json.dumps(processed, ensure_ascii=False)
-    raw       = re.sub(r'"§(-?[\d.]+)§"', r'\1', raw)
-    return Response(content=raw, media_type="application/json")
+
+# ── COMPANY TYPE DETECTION ────────────────────────────────────────
+def detect_company_type(text: str) -> str:
+    """Detect company structure to apply correct schema."""
+    lower = text.lower()
+    if "proprietorship" in lower or "sole proprietor" in lower:
+        return "proprietorship"
+    if "partnership" in lower:
+        return "partnership"
+    if "trust" in lower or "ngo" in lower or "society" in lower:
+        return "trust"
+    if "llp" in lower or "limited liability" in lower:
+        return "llp"
+    if "private limited" in lower or "pvt" in lower or "ltd" in lower:
+        return "pvt_ltd"
+    return "pvt_ltd"  # default
 
 
 # ── TEXT EXTRACTION ───────────────────────────────────────────────
 def extract_page_text_structured(page) -> str:
+    """Coordinate-sorted extraction — preserves table column alignment."""
     try:
         raw_dict  = page.get_text("dict")
         all_spans = []
@@ -119,52 +119,36 @@ def extract_page_text_structured(page) -> str:
 
 # ── PAGE SCORERS ──────────────────────────────────────────────────
 def score_financial_page(text: str) -> int:
+    """High numbers + pipe separators + financial keywords = high score."""
     score = 0
     lower = text.lower()
-    lines = text.split('\n')
 
-    score += len(INDIAN_NUMBER_RE.findall(text)) * 6
-    score += len(re.findall(r'\d[\d,]{4,}', text)) * 3
+    score += len(INDIAN_NUMBER_RE.findall(text)) * 4
+    score += len(re.findall(r'\d[\d,]{4,}', text)) * 2
 
     for kw in FINANCIAL_KEYWORDS:
         if kw in lower:
             score += 3
 
-    # Only pipes on lines that also have numbers — prevents OCR prose inflation
-    numeric_pipe_lines = sum(
-        1 for l in lines if '|' in l and re.search(r'\d{2,}', l)
-    )
-    score += numeric_pipe_lines * 5
-
-    # Lines with 2+ large numbers = real table data rows
-    multi_num_lines = sum(
-        1 for l in lines if len(re.findall(r'\d{4,}', l)) >= 2
-    )
-    score += multi_num_lines * 10
+    score += text.count("|") * 3
 
     year_hits = re.findall(
-        r'(FY\s*\d{2,4}|20\d{2}[-\u2013]\d{2,4}|31[.\-/]\d{2}[.\-/]\d{2,4})', text
+        r'(FY\s*\d{2,4}|20\d{2}[-–]\d{2,4}|31[.\-/]\d{2}[.\-/]\d{2,4})', text
     )
     score += len(year_hits) * 5
 
-    words      = len(text.split())
-    num_count  = len(re.findall(r'\d+', text))
-    pipe_count = text.count('|')
-
-    if words > 80 and (num_count / max(words, 1)) < 0.05:
-        score = int(score * 0.15)
-
-    # OCR prose penalty: many pipes but almost no numbers
-    if pipe_count > 20 and (num_count / max(pipe_count, 1)) < 0.1:
-        score = int(score * 0.2)
+    words     = len(text.split())
+    num_count = len(re.findall(r'\d+', text))
+    if words > 80 and (num_count / words) < 0.05:
+        score = int(score * 0.3)
 
     return score
 
 
 def score_notes_page(text: str) -> int:
+    """Notes pages have note numbers, policy language, and smaller tables."""
     score = 0
     lower = text.lower()
-    lines = text.split('\n')
 
     for kw in NOTES_KEYWORDS:
         if kw in lower:
@@ -177,27 +161,19 @@ def score_notes_page(text: str) -> int:
     score += len(note_hits) * 8
 
     score += len(INDIAN_NUMBER_RE.findall(text)) * 2
+    score += text.count("|") * 2
 
-    numeric_pipe_lines = sum(
-        1 for l in lines if '|' in l and re.search(r'\d{2,}', l)
-    )
-    score += numeric_pipe_lines * 3
-
-    words      = len(text.split())
-    num_count  = len(re.findall(r'\d+', text))
-    pipe_count = text.count('|')
-
-    if words > 30 and (num_count / max(words, 1)) > 0.5:
+    words     = len(text.split())
+    num_count = len(re.findall(r'\d+', text))
+    if words > 30 and (num_count / words) > 0.5:
         score = int(score * 0.4)
-
-    if pipe_count > 20 and (num_count / max(pipe_count, 1)) < 0.1:
-        score = int(score * 0.25)
 
     return score
 
 
-# ── SMART TEXT SELECTOR ───────────────────────────────────────────
-def select_pages(page_texts: list, scorer_fn, char_limit: int, top_n: int = 10) -> str:
+# ── SMART PAGE SELECTOR ───────────────────────────────────────────
+def select_pages(page_texts: list, scorer_fn, char_limit: int, top_n: int = 20) -> str:
+    """Score all pages, take top N, re-sort into document order."""
     scored = []
     for page_num, text in enumerate(page_texts):
         score = scorer_fn(text)
@@ -212,7 +188,7 @@ def select_pages(page_texts: list, scorer_fn, char_limit: int, top_n: int = 10) 
     for _, _, text in top:
         if len(result) + len(text) + 1 > char_limit:
             remaining = char_limit - len(result)
-            if remaining > 400:
+            if remaining > 800:
                 result += text[:remaining] + "\n"
             break
         result += text + "\n"
@@ -242,23 +218,13 @@ def compute_item_confidence(
     return min(score, 100)
 
 
-# ── COMPANY NAME FALLBACK ─────────────────────────────────────────
-def extract_company_name_fallback(full_text: str) -> str:
-    candidates = re.findall(
-        r'([A-Z][A-Za-z\s&,.\-]+(?:Limited|Pvt\.?\s*Ltd\.?|LLP|Inc\.?|Corporation|Enterprises|Industries|Company))',
-        full_text[:2000]
-    )
-    if candidates:
-        return max(candidates, key=len).strip()
-    return "Unknown Company"
-
-
-# ── MAIN EXTRACT ENDPOINT ─────────────────────────────────────────
-@app.post("/extract")
+# ── MAIN EXTRACT ENDPOINT ───────────────────────────────���─────────
+@app.post("/extract", response_model=ExtractResponse)
 async def extract_pdf(request: Request, file: UploadFile = File(...)):
     if not file.filename.endswith('.pdf'):
         raise HTTPException(400, "Only PDF files allowed")
 
+    # ── Parse ALL *_schema form fields dynamically ────────────────
     form_data   = await request.form()
     doc_schemas = {}
     for field_name, field_value in form_data.items():
@@ -275,6 +241,7 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
             "bs":  [{"key": "currentAssets", "title": "Current Assets"}]
         }
 
+    # ── Extract all page texts ────────────────────────────────────
     contents   = await file.read()
     pdf_doc    = fitz.open(stream=contents, filetype="pdf")
     page_texts = []
@@ -294,17 +261,14 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
     if not full_text.strip():
         raise HTTPException(400, "No extractable text found in PDF.")
 
-    financial_text = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, top_n=10)
-    notes_text     = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     top_n=5)
+    # ── Detect company type ────────────────────────────────────────
+    company_type = detect_company_type(full_text)
 
-    # ── Hard cap — prevents 413 on large PDFs ────────────────────
-    combined = len(financial_text) + len(notes_text)
-    if combined > MAX_COMBINED_CHARS:
-        fin_budget   = int(MAX_COMBINED_CHARS * 0.82)
-        notes_budget = MAX_COMBINED_CHARS - fin_budget
-        financial_text = financial_text[:fin_budget]
-        notes_text     = notes_text[:notes_budget]
+    # ── Smart page selection — two separate passes ────────────────
+    financial_text = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, top_n=15)
+    notes_text     = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     top_n=12)
 
+    # ── Build dynamic schema sections for prompt ──────────────────
     doc_keys_list = list(doc_schemas.keys())
     doc_keys_json = json.dumps(doc_keys_list)
     schema_desc   = ""
@@ -315,12 +279,15 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
         schema_desc += f'\n{doc_key.upper()} section keys:\n{desc}\n'
         data_hint   += f'    "{doc_key}": {{ "section_key": {{ "FY2024": {{ "Line Item": 1234.00 }} }} }},\n'
 
-    prompt = f"""You are a senior financial analyst extraction engine specialising in Indian statutory audit reports (Schedule III format).
+    # ── CALL 1 — Financial Data (P&L, BS, Cash Flow) ──────────────
+    # ✅ ENHANCED PROMPT with Company-Type-Specific Rules
+    fin_prompt = f"""You are a senior financial analyst extraction engine specialising in Indian statutory audit reports (Schedule III format).
+Company Type Detected: {company_type}
 
 The document text has been extracted with table columns separated by " | ".
 Each row: Line Item Name | Note No | VALUE_YEAR1 | VALUE_YEAR2
 
-Return ONLY valid JSON with this exact structure:
+Return ONLY valid JSON:
 
 {{
   "company_name": "string",
@@ -328,12 +295,101 @@ Return ONLY valid JSON with this exact structure:
   "all_periods": ["FY2024", "FY2023"],
   "confidence": {{ "Exact Item Name": 95 }},
   "data": {{
-{data_hint}  }},
+{data_hint}  }}
+}}
+
+The "data" object MUST contain keys for: {doc_keys_json}
+
+{schema_desc}
+
+CRITICAL EXTRACTION RULES (India Schedule III):
+
+1. YEAR DETECTION: First value column = most recent year, second = prior year. Normalise → "FY20XX".
+   - Only create FY entry if ACTUAL data exists. No zero-filled years.
+   - Read year headers independently; NEVER copy values between years.
+
+2. COMPANY TYPE ADJUSTMENTS:
+   - {company_type.upper()}: {'No Non-Current sections. Skip any Non-Current Assets/Liabilities.' if company_type == 'proprietorship' else 'Include all Schedule III sections as present.'}
+   - Proprietorship/Partnership: Equity = Opening Capital + Profit - Withdrawals (NOT single value).
+   - Trust: Use "Capital Fund" not "Equity"; include "Grants" and "Donations" separately.
+
+3. NUMBER EXTRACTION (CRITICAL FOR BOT VFX / HYPHEN ERRORS):
+   - READ EXACT VALUES FROM PDF. Match each digit character-by-character.
+   - Indian format: "12,34,567.89" = 1234567.89 (NOT 123456789)
+   - Remove commas ONLY: "1,26,44,429.00" → 12644429.00
+   - If decimal places differ (1.70 vs 1.72), re-check source PDF twice. Use EXACT source value.
+   - Flag confidence < 70 for any digit misread risk.
+
+4. ASSET BREAKDOWN (Fixes Prodapt / Warehousing errors):
+   - Current Assets MUST include: Trade Receivables + Inventory + Cash + Prepayments + Advances + Other Current Assets
+   - Non-Current Assets MUST include: PPE + Intangible Assets + Investments + Long-term Receivables + Other NCAs
+   - If section empty or field missing in source, use 0 — do NOT merge with other items.
+
+5. LIABILITY BREAKDOWN:
+   - Current Liabilities: Trade Payables + Short-term Borrowings + Advances + Other CL + Provision (as separate items)
+   - Non-Current Liabilities: Long-term Borrowings + Deferred Tax + Other NCL
+   - Do NOT aggregate; keep item-level detail.
+
+6. EXPENSE DETAIL (Fixes M/S HLR / 24 Framez errors):
+   - Employee Cost: Salary + Wages + Benefits (separate lines if available)
+   - Finance Costs: Interest + Bank Charges (keep separate)
+   - Tax: Base Tax + Cess + Interest on Tax (keep EACH component separate)
+   - Depreciation: Exact line value (not inferred from difference)
+   - Do NOT group expenses into single totals unless source shows "Total Expenses".
+
+7. CASH FLOW MOVEMENT (Fixes 24 Framez):
+   - Cash Flow = Closing Balance MINUS Opening Balance (yearly movement)
+   - NOT just closing balance alone.
+   - If movement data missing, extract opening and closing separately; calculate movement in post-processing.
+
+8. CONFIDENCE SCORING:
+   - 90-100: Value clearly visible in table, exact match to source text
+   - 70-89: Inferred or slightly unclear; decimal/digit confidence < 100%
+   - <70: Hallucinated or cannot verify in source
+
+9. EDGE CASES:
+   - "-", blank, "Nil", "N/A" → 0.0 (not null)
+   - Multiple years in single cell → use most recent year for FY2024 column
+   - Text merged with numbers → extract numbers only
+   - Notes reference: If note says "See Note 5", include note value with source reference
+
+10. RETURN ONLY JSON. No markdown. No explanation. No code blocks.
+
+Document:
+{financial_text}"""
+
+    try:
+        fin_response = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are a strict financial OCR parser for Indian statutory reports ({company_type} company type). Extract ONLY explicitly present values from source text. Verify every digit against source. Return only valid JSON."
+                },
+                {"role": "user", "content": fin_prompt}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0,
+            max_tokens=4000,
+            response_format={"type": "json_object"}
+        )
+        fin_parsed = json.loads(fin_response.choices[0].message.content)
+    except Exception as e:
+        raise HTTPException(500, f"Financial extraction error: {str(e)}")
+
+    # ── CALL 2 — Notes to Accounts ────────────────────────────────
+    notes_parsed = {"notes_to_accounts": []}
+
+    if notes_text.strip():
+        notes_prompt = f"""You are extracting Notes to Accounts from an Indian statutory audit report.
+
+Return ONLY valid JSON:
+
+{{
   "notes_to_accounts": [
     {{
       "number": "1",
       "title": "Note Title",
-      "text": "Free-text accounting policy or observation (if any)",
+      "text": "Any accounting policy or qualitative text. Empty string if none.",
       "table": [
         {{ "item": "Sub-item name", "FY2024": 1234.00, "FY2023": 1000.00 }}
       ]
@@ -341,57 +397,49 @@ Return ONLY valid JSON with this exact structure:
   ]
 }}
 
-The "data" object MUST contain keys for: {doc_keys_json}
+Rules:
+- Extract EVERY numbered note and named schedule found in the document
+- "number": note number as string ("1", "2", "2a", etc.)
+- "title": the heading of the note
+- "text": policy or qualitative explanation — empty string if none
+- "table": array of line items with per-year values. [] if the note has no table.
+- Remove all commas from numbers: "1,26,44,429.00" → 12644429.00
+- Use "FY20XX" format for all year keys
+- Return ONLY the JSON. No markdown. No explanation.
 
-{schema_desc}
+Document:
+{notes_text}"""
 
-═══════════ FINANCIAL STATEMENTS ═══════════
-{financial_text}
+        try:
+            notes_response = client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a strict financial notes extractor. Return only valid JSON."
+                    },
+                    {"role": "user", "content": notes_prompt}
+                ],
+                model="llama-3.3-70b-versatile",
+                temperature=0,
+                max_tokens=4000,
+                response_format={"type": "json_object"}
+            )
+            notes_parsed = json.loads(notes_response.choices[0].message.content)
+        except Exception as e:
+            print(f"Notes extraction failed (non-fatal): {str(e)}")
+            notes_parsed = {"notes_to_accounts": []}
 
-═══════════ NOTES TO ACCOUNTS ═══════════
-{notes_text}
-
-Extraction Rules:
-1. YEAR DETECTION: First value column = most recent year, second = prior year. Normalise → "FY20XX".
-2. FINANCIAL DATA:
-   - Map each line item to the nearest schema section key
-   - Read ONLY values physically in each cell — NEVER infer or carry over
-   - "-", blank, "Nil" → 0
-   - Read each year column independently — NEVER copy a value to both years
-   - Remove all commas: "1,26,44,429.00" → 12644429.00. All positive floats.
-3. NOTES TO ACCOUNTS:
-   - Extract numbered financial notes and their tables only
-   - Skip auditor reports, legal annexures, compliance paragraphs
-4. CONFIDENCE: self-score 0-100 per financial item.
-5. Return ONLY the JSON. No markdown."""
-
-    try:
-        response = client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a strict financial OCR parser for Indian statutory reports. Extract only explicitly present values. Return only valid JSON."
-                },
-                {"role": "user", "content": prompt}
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0,
-            max_tokens=4000,
-            response_format={"type": "json_object"}
-        )
-        parsed = json.loads(response.choices[0].message.content)
-    except Exception as e:
-        raise HTTPException(500, f"AI Processing Error: {str(e)}")
-
-    # ── Clean numeric values — always 2 decimal places ────────────
+    # ── Clean numeric values ──────────────────────────────────────
     def clean_val(v):
         try:
-            return round(float(str(v).replace(',', '').replace(' ', '').strip()), 2)
+            # Handle Indian number format: "1,26,44,429.00" → 12644429.00
+            cleaned = str(v).replace(',', '').replace(' ', '').strip()
+            return float(cleaned)
         except Exception:
-            return 0.00
+            return 0.0
 
-    # ── Process financial data ────────────────────────────────────
-    raw_data   = parsed.get("data", {})
+    # ── Process all financial doc types dynamically ───────────────
+    raw_data   = fin_parsed.get("data", {})
     final_data = {}
 
     for doc_key in doc_keys_list:
@@ -405,8 +453,8 @@ Extraction Rules:
                             k: clean_val(v) for k, v in items.items()
                         }
 
-    # ── Clean notes ───────────────────────────────────────────────
-    raw_notes   = parsed.get("notes_to_accounts", [])
+    # ── Clean notes_to_accounts ───────────────────────────────────
+    raw_notes   = notes_parsed.get("notes_to_accounts", [])
     clean_notes = []
 
     for note in raw_notes:
@@ -424,8 +472,8 @@ Extraction Rules:
             "table":  clean_table
         })
 
-    # ── Confidence ────────────────────────────────────────────────
-    raw_conf        = parsed.get("confidence", {})
+    # ── Confidence scores (raw, no threshold logic) ───────────────
+    raw_conf        = fin_parsed.get("confidence", {})
     item_confidence = {}
 
     for doc_key, doc_data in final_data.items():
@@ -437,23 +485,18 @@ Extraction Rules:
                             item_name, item_val, full_text, raw_conf
                         )
 
-    # ── Company name — always populated ──────────────────────────
-    company_name = (
-        parsed.get("company_name") or
-        extract_company_name_fallback(full_text)
-    )
-
-    return financial_json_response({
-        "mapped": {
-            "companyname":       company_name,
-            "period":            parsed.get("period", "Unknown"),
-            "allperiods":        parsed.get("all_periods", [parsed.get("period", "Unknown")]),
+    return ExtractResponse(
+        mapped={
+            "companyname":       fin_parsed.get("company_name", "Unknown"),
+            "period":            fin_parsed.get("period", "Unknown"),
+            "allperiods":        fin_parsed.get("all_periods", [fin_parsed.get("period", "Unknown")]),
             "data":              final_data,
             "notes_to_accounts": clean_notes,
+            "company_type":      company_type,
         },
-        "raw":        full_text[:3000],
-        "confidence": item_confidence
-    })
+        raw=full_text[:3000],
+        confidence=item_confidence
+    )
 
 
 # ── HEALTH & DEBUG ────────────────────────────────────────────────
@@ -463,7 +506,7 @@ def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "llama-3.3-70b-versatile", "context": "131k tokens"}
+    return {"status": "ok", "model": "llama-3.3-70b-versatile", "tier": "free-12k-tpm-safe"}
 
 @app.get("/ping")
 def ping():
@@ -492,8 +535,8 @@ async def debug_extract(file: UploadFile = File(...)):
             "preview":         text[:120]
         })
 
-    fin_text   = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, 10)
-    notes_text = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,      5)
+    fin_text   = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, 15)
+    notes_text = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     12)
     pdf_doc.close()
 
     return {
