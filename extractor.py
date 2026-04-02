@@ -26,9 +26,9 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
 client = Groq(api_key=GROQ_API_KEY)
 
-# ── TOKEN BUDGET (Groq free tier = 12,000 TPM hard limit) ────────
-FINANCIAL_TEXT_LIMIT = 24_000
-NOTES_TEXT_LIMIT     = 18_000
+# ── TOKEN BUDGET FIX (Keeps you under Groq's 12,000 TPM limit) ──
+FINANCIAL_TEXT_LIMIT = 12_000  # Reduced from 24k
+NOTES_TEXT_LIMIT     = 8_000   # Reduced from 18k
 
 FINANCIAL_KEYWORDS = [
     "revenue", "income", "expenditure", "expenses", "profit", "loss",
@@ -218,7 +218,7 @@ def compute_item_confidence(
     return min(score, 100)
 
 
-# ── MAIN EXTRACT ENDPOINT ───────────────────────────────���─────────
+# ── MAIN EXTRACT ENDPOINT ─────────────────────────────────────────
 @app.post("/extract", response_model=ExtractResponse)
 async def extract_pdf(request: Request, file: UploadFile = File(...)):
     if not file.filename.endswith('.pdf'):
@@ -280,7 +280,6 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
         data_hint   += f'    "{doc_key}": {{ "section_key": {{ "FY2024": {{ "Line Item": 1234.00 }} }} }},\n'
 
     # ── CALL 1 — Financial Data (P&L, BS, Cash Flow) ──────────────
-    # ✅ ENHANCED PROMPT with Company-Type-Specific Rules
     fin_prompt = f"""You are a senior financial analyst extraction engine specialising in Indian statutory audit reports (Schedule III format).
 Company Type Detected: {company_type}
 
@@ -355,6 +354,8 @@ CRITICAL EXTRACTION RULES (India Schedule III):
 
 10. RETURN ONLY JSON. No markdown. No explanation. No code blocks.
 
+11. NO MATH EXPRESSIONS (CRITICAL): All values MUST be a single, final float number (e.g., 1500.0). NEVER output mathematical expressions like "1000 + 200". Perform the math yourself and output only the final number.
+
 Document:
 {financial_text}"""
 
@@ -405,6 +406,7 @@ Rules:
 - "table": array of line items with per-year values. [] if the note has no table.
 - Remove all commas from numbers: "1,26,44,429.00" → 12644429.00
 - Use "FY20XX" format for all year keys
+- NO MATH EXPRESSIONS: All values must be final floats. Do not output "100+20".
 - Return ONLY the JSON. No markdown. No explanation.
 
 Document:
