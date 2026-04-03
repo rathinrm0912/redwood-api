@@ -1,4 +1,3 @@
-# extractor.py — Original code + 3 targeted fixes only
 import fitz
 import io
 import os
@@ -26,12 +25,18 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
 client = Groq(api_key=GROQ_API_KEY)
 
-# FIX 1 — increased from 12_000 to 14_000 (more room for large PDFs)
-FINANCIAL_TEXT_LIMIT = 14_000
-NOTES_TEXT_LIMIT     = 8_000
+# ── MODEL FALLBACK CHAIN ──────────────────────────────────────────
+# Tries in order when rate limits hit. 8b-instant has 500k TPD (5x higher).
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",  # Best quality — 100k TPD
+    "llama-3.1-8b-instant",     # Fast fallback — 500k TPD
+    "gemma2-9b-it",             # Emergency fallback — 500k TPD
+]
 
-# FIX 2 — hard cap on OCR pages to prevent timeout on image-heavy PDFs
-MAX_OCR_PAGES = 8
+# ── LIMITS ────────────────────────────────────────────────────────
+FINANCIAL_TEXT_LIMIT = 14_000   # chars sent to Groq for financial data
+NOTES_TEXT_LIMIT     = 8_000    # chars sent to Groq for notes
+MAX_OCR_PAGES        = 8        # hard cap — prevents image-heavy PDFs timing out
 
 FINANCIAL_KEYWORDS = [
     "revenue", "income", "expenditure", "expenses", "profit", "loss",
@@ -77,6 +82,7 @@ def detect_company_type(text: str) -> str:
 
 # ── TEXT EXTRACTION ───────────────────────────────────────────────
 def extract_page_text_structured(page) -> str:
+    """Coordinate-sorted extraction — preserves table column alignment."""
     try:
         raw_dict  = page.get_text("dict")
         all_spans = []
@@ -216,6 +222,39 @@ def compute_item_confidence(
     return min(score, 100)
 
 
+# ── GROQ CALL WITH MODEL FALLBACK ────────────────────────────────
+def groq_call_with_fallback(messages: list, max_tokens: int, label: str = "") -> dict:
+    """
+    Tries each model in GROQ_MODELS in order.
+    Falls through to next model only on 429 rate-limit errors.
+    Raises immediately on any other error type.
+    """
+    last_error = None
+    for model in GROQ_MODELS:
+        try:
+            response = client.chat.completions.create(
+                messages=messages,
+                model=model,
+                temperature=0,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"}
+            )
+            print(f"[Groq{' ' + label if label else ''}] Used model: {model}")
+            return json.loads(response.choices[0].message.content)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in err_str or "rate_limit" in err_str:
+                print(f"[Groq] {model} rate limited — trying next model")
+                last_error = e
+                continue
+            # Non-rate-limit error — raise immediately, no point trying other models
+            raise e
+    # All models exhausted
+    raise Exception(
+        f"All models rate limited. Try again later. Last error: {str(last_error)}"
+    )
+
+
 # ── MAIN EXTRACT ENDPOINT ─────────────────────────────────────────
 @app.post("/extract", response_model=ExtractResponse)
 async def extract_pdf(request: Request, file: UploadFile = File(...)):
@@ -239,29 +278,31 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
             "bs":  [{"key": "currentAssets", "title": "Current Assets"}]
         }
 
-    # ── Extract all page texts ────────────────────────────────────
+    # ── Extract all page texts with OCR cap ───────────────────────
     contents   = await file.read()
     pdf_doc    = fitz.open(stream=contents, filetype="pdf")
     page_texts = []
-    # FIX 2 — OCR cap: only OCR up to MAX_OCR_PAGES image pages
-    # Prevents signature/letterhead pages from causing 200s timeout
     ocr_count  = 0
 
     for page_num in range(len(pdf_doc)):
         page = pdf_doc[page_num]
         text = extract_page_text_structured(page)
+
         if not text.strip() and ocr_count < MAX_OCR_PAGES:
-            # Only OCR pages that actually contain image blocks
+            # Only OCR pages that actually contain image blocks —
+            # skips blank/signature/whitespace-only pages
             page_dict        = page.get_text("dict")
             has_image_blocks = any(
                 b.get("type") == 1 for b in page_dict.get("blocks", [])
             )
             if has_image_blocks:
-                # 1.5x is sufficient quality and ~40% faster than original 2x
+                # 1.5x is sufficient quality and ~40% faster than 2x
                 pix  = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
                 img  = Image.open(io.BytesIO(pix.tobytes("png")))
                 text = pytesseract.image_to_string(img, lang='eng').strip()
                 ocr_count += 1
+                print(f"[OCR] Page {page_num + 1} OCR'd ({ocr_count}/{MAX_OCR_PAGES})")
+
         page_texts.append(text)
 
     pdf_doc.close()
@@ -273,7 +314,7 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
     # ── Detect company type ────────────────────────────────────────
     company_type = detect_company_type(full_text)
 
-    # ── Smart page selection — two separate passes ────────────────
+    # ── Smart page selection ───────────────────────────────────────
     financial_text = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, top_n=15)
     notes_text     = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     top_n=12)
 
@@ -321,14 +362,13 @@ CRITICAL EXTRACTION RULES (India Schedule III):
    - Proprietorship/Partnership: Equity = Opening Capital + Profit - Withdrawals (NOT single value).
    - Trust: Use "Capital Fund" not "Equity"; include "Grants" and "Donations" separately.
 
-3. NUMBER EXTRACTION (CRITICAL FOR BOT VFX / HYPHEN ERRORS):
+3. NUMBER EXTRACTION (CRITICAL):
    - READ EXACT VALUES FROM PDF. Match each digit character-by-character.
    - Indian format: "12,34,567.89" = 1234567.89 (NOT 123456789)
    - Remove commas ONLY: "1,26,44,429.00" → 12644429.00
-   - If decimal places differ (1.70 vs 1.72), re-check source PDF twice. Use EXACT source value.
    - Flag confidence < 70 for any digit misread risk.
 
-4. ASSET BREAKDOWN (Fixes Prodapt / Warehousing errors):
+4. ASSET BREAKDOWN:
    - Current Assets MUST include: Trade Receivables + Inventory + Cash + Prepayments + Advances + Other Current Assets
    - Non-Current Assets MUST include: PPE + Intangible Assets + Investments + Long-term Receivables + Other NCAs
    - If section empty or field missing in source, use 0 — do NOT merge with other items.
@@ -338,38 +378,37 @@ CRITICAL EXTRACTION RULES (India Schedule III):
    - Non-Current Liabilities: Long-term Borrowings + Deferred Tax + Other NCL
    - Do NOT aggregate; keep item-level detail.
 
-6. EXPENSE DETAIL (Fixes M/S HLR / 24 Framez errors):
+6. EXPENSE DETAIL:
    - Employee Cost: Salary + Wages + Benefits (separate lines if available)
    - Finance Costs: Interest + Bank Charges (keep separate)
    - Tax: Base Tax + Cess + Interest on Tax (keep EACH component separate)
    - Depreciation: Exact line value (not inferred from difference)
    - Do NOT group expenses into single totals unless source shows "Total Expenses".
 
-7. CASH FLOW MOVEMENT (Fixes 24 Framez):
+7. CASH FLOW MOVEMENT:
    - Cash Flow = Closing Balance MINUS Opening Balance (yearly movement)
    - NOT just closing balance alone.
-   - If movement data missing, extract opening and closing separately; calculate movement in post-processing.
 
 8. CONFIDENCE SCORING:
-   - 90-100: Value clearly visible in table, exact match to source text
-   - 70-89: Inferred or slightly unclear; decimal/digit confidence < 100%
-   - <70: Hallucinated or cannot verify in source
+   - 90-100: Value clearly visible, exact match
+   - 70-89: Inferred or slightly unclear
+   - <70: Cannot verify in source
 
 9. EDGE CASES:
    - "-", blank, "Nil", "N/A" → 0.0 (not null)
    - Multiple years in single cell → use most recent year for FY2024 column
    - Text merged with numbers → extract numbers only
-   - Notes reference: If note says "See Note 5", include note value with source reference
 
 10. RETURN ONLY JSON. No markdown. No explanation. No code blocks.
 
-11. NO MATH EXPRESSIONS (CRITICAL): All values MUST be a single, final float number (e.g., 1500.0). NEVER output mathematical expressions like "1000 + 200". Perform the math yourself and output only the final number.
+11. NO MATH EXPRESSIONS (CRITICAL): All values MUST be a single final float (e.g., 1500.0).
+    NEVER output expressions like "1000 + 200". Perform arithmetic yourself.
 
 Document:
 {financial_text}"""
 
     try:
-        fin_response = client.chat.completions.create(
+        fin_parsed = groq_call_with_fallback(
             messages=[
                 {
                     "role": "system",
@@ -377,13 +416,9 @@ Document:
                 },
                 {"role": "user", "content": fin_prompt}
             ],
-            model="llama-3.3-70b-versatile",
-            temperature=0,
-            # FIX 3 — increased from 4000 to 8000 (fixes truncation on large PDFs)
             max_tokens=8000,
-            response_format={"type": "json_object"}
+            label="Financial"
         )
-        fin_parsed = json.loads(fin_response.choices[0].message.content)
     except Exception as e:
         raise HTTPException(500, f"Financial extraction error: {str(e)}")
 
@@ -423,7 +458,7 @@ Document:
 {notes_text}"""
 
         try:
-            notes_response = client.chat.completions.create(
+            notes_parsed = groq_call_with_fallback(
                 messages=[
                     {
                         "role": "system",
@@ -431,12 +466,9 @@ Document:
                     },
                     {"role": "user", "content": notes_prompt}
                 ],
-                model="llama-3.3-70b-versatile",
-                temperature=0,
                 max_tokens=4000,
-                response_format={"type": "json_object"}
+                label="Notes"
             )
-            notes_parsed = json.loads(notes_response.choices[0].message.content)
         except Exception as e:
             print(f"Notes extraction failed (non-fatal): {str(e)}")
             notes_parsed = {"notes_to_accounts": []}
@@ -517,7 +549,11 @@ def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "llama-3.3-70b-versatile", "tier": "free-12k-tpm-safe"}
+    return {
+        "status": "ok",
+        "models": GROQ_MODELS,
+        "tier":   "free-with-fallback"
+    }
 
 @app.get("/ping")
 def ping():
