@@ -26,11 +26,11 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "gsk_jt96hHx18YXZAOli0cFIWGdyb3FY4eMzqT
 client = Groq(api_key=GROQ_API_KEY)
 
 # ── MODEL FALLBACK CHAIN ──────────────────────────────────────────
-# Tries in order when rate limits hit. 8b-instant has 500k TPD (5x higher).
+# Tries in order on rate-limit or decommission errors
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",  # Best quality — 100k TPD
     "llama-3.1-8b-instant",     # Fast fallback — 500k TPD
-    "gemma2-9b-it",             # Emergency fallback — 500k TPD
+    "qwen/qwen3-32b",           # Emergency fallback — active Apr 2026
 ]
 
 # ── LIMITS ────────────────────────────────────────────────────────
@@ -222,11 +222,11 @@ def compute_item_confidence(
     return min(score, 100)
 
 
-# ── GROQ CALL WITH MODEL FALLBACK ────────────────────────────────
+# ── GROQ CALL WITH MODEL FALLBACK ─────────────────────────────────
 def groq_call_with_fallback(messages: list, max_tokens: int, label: str = "") -> dict:
     """
     Tries each model in GROQ_MODELS in order.
-    Falls through to next model only on 429 rate-limit errors.
+    Falls through to next model on 429 rate-limit OR decommissioned model errors.
     Raises immediately on any other error type.
     """
     last_error = None
@@ -243,16 +243,14 @@ def groq_call_with_fallback(messages: list, max_tokens: int, label: str = "") ->
             return json.loads(response.choices[0].message.content)
         except Exception as e:
             err_str = str(e).lower()
-            if "429" in err_str or "rate_limit" in err_str:
-                print(f"[Groq] {model} rate limited — trying next model")
+            # Fall through on rate limits or decommissioned model — try next
+            if "429" in err_str or "rate_limit" in err_str or "decommissioned" in err_str:
+                print(f"[Groq] {model} unavailable ({err_str[:80]}) — trying next model")
                 last_error = e
                 continue
-            # Non-rate-limit error — raise immediately, no point trying other models
+            # Any other error (auth, bad JSON, etc.) — raise immediately
             raise e
-    # All models exhausted
-    raise Exception(
-        f"All models rate limited. Try again later. Last error: {str(last_error)}"
-    )
+    raise Exception(f"All models exhausted. Last error: {str(last_error)}")
 
 
 # ── MAIN EXTRACT ENDPOINT ─────────────────────────────────────────
