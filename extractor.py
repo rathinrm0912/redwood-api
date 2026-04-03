@@ -1,4 +1,4 @@
-# extractor.py — Original code + 3 targeted fixes only
+
 import fitz
 import io
 import os
@@ -26,12 +26,9 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
 client = Groq(api_key=GROQ_API_KEY)
 
-# FIX 1 — increased from 12_000 to 14_000 (more room for large PDFs)
-FINANCIAL_TEXT_LIMIT = 14_000
-NOTES_TEXT_LIMIT     = 8_000
-
-# FIX 2 — hard cap on OCR pages to prevent timeout on image-heavy PDFs
-MAX_OCR_PAGES = 8
+# ── TOKEN BUDGET FIX (Keeps you under Groq's 12,000 TPM limit) ──
+FINANCIAL_TEXT_LIMIT = 12_000  # Reduced from 24k
+NOTES_TEXT_LIMIT     = 8_000   # Reduced from 18k
 
 FINANCIAL_KEYWORDS = [
     "revenue", "income", "expenditure", "expenses", "profit", "loss",
@@ -50,7 +47,7 @@ NOTES_KEYWORDS = [
     "revenue recognition", "lease", "segment", "earnings per share"
 ]
 
-INDIAN_NUMBER_RE = re.compile(r'\d{1,2}(,\d{2})*,\d{3}(\.\d+)?|\d[\d,]+\.\d{2}')
+INDIAN_NUMBER_RE = re.compile(r'\\\\d{1,2}(,\\\\d{2})*,\\\\d{3}(\\\\.\\\\d+)?|\\\\d[\\\\d,]+\\\\.\\\\d{2}')
 
 
 class ExtractResponse(BaseModel):
@@ -61,6 +58,7 @@ class ExtractResponse(BaseModel):
 
 # ── COMPANY TYPE DETECTION ────────────────────────────────────────
 def detect_company_type(text: str) -> str:
+    """Detect company structure to apply correct schema."""
     lower = text.lower()
     if "proprietorship" in lower or "sole proprietor" in lower:
         return "proprietorship"
@@ -72,11 +70,12 @@ def detect_company_type(text: str) -> str:
         return "llp"
     if "private limited" in lower or "pvt" in lower or "ltd" in lower:
         return "pvt_ltd"
-    return "pvt_ltd"
+    return "pvt_ltd"  # default
 
 
 # ── TEXT EXTRACTION ───────────────────────────────────────────────
 def extract_page_text_structured(page) -> str:
+    """Coordinate-sorted extraction — preserves table column alignment."""
     try:
         raw_dict  = page.get_text("dict")
         all_spans = []
@@ -112,7 +111,7 @@ def extract_page_text_structured(page) -> str:
             row_text = "  |  ".join(s[2] for s in sorted(row, key=lambda s: s[1]))
             lines.append(row_text)
 
-        return "\n".join(lines)
+        return "\\\\n".join(lines)
 
     except Exception:
         return page.get_text().strip()
@@ -120,11 +119,12 @@ def extract_page_text_structured(page) -> str:
 
 # ── PAGE SCORERS ──────────────────────────────────────────────────
 def score_financial_page(text: str) -> int:
+    """High numbers + pipe separators + financial keywords = high score."""
     score = 0
     lower = text.lower()
 
     score += len(INDIAN_NUMBER_RE.findall(text)) * 4
-    score += len(re.findall(r'\d[\d,]{4,}', text)) * 2
+    score += len(re.findall(r'\\\\d[\\\\d,]{4,}', text)) * 2
 
     for kw in FINANCIAL_KEYWORDS:
         if kw in lower:
@@ -133,19 +133,20 @@ def score_financial_page(text: str) -> int:
     score += text.count("|") * 3
 
     year_hits = re.findall(
-        r'(FY\s*\d{2,4}|20\d{2}[-–]\d{2,4}|31[.\-/]\d{2}[.\-/]\d{2,4})', text
+        r'(FY\\\\s*\\\\d{2,4}|20\\\\d{2}[-–]\\\\d{2,4}|31[.\\\\-/]\\\\d{2}[.\\\\-/]\\\\d{2,4})', text
     )
     score += len(year_hits) * 5
 
     words     = len(text.split())
-    num_count = len(re.findall(r'\d+', text))
-    if words > 80 and words > 0 and (num_count / words) < 0.05:
+    num_count = len(re.findall(r'\\\\d+', text))
+    if words > 80 and (num_count / words) < 0.05:
         score = int(score * 0.3)
 
     return score
 
 
 def score_notes_page(text: str) -> int:
+    """Notes pages have note numbers, policy language, and smaller tables."""
     score = 0
     lower = text.lower()
 
@@ -154,7 +155,7 @@ def score_notes_page(text: str) -> int:
             score += 5
 
     note_hits = re.findall(
-        r'\bnote\s*\d+\b|\b\d+\.\s+[A-Z]|\bschedule\s+[IVX\d]+\b',
+        r'\\\\bnote\\\\s*\\\\d+\\\\b|\\\\b\\\\d+\\\\.\\\\s+[A-Z]|\\\\bschedule\\\\s+[IVX\\\\d]+\\\\b',
         text, re.IGNORECASE
     )
     score += len(note_hits) * 8
@@ -163,8 +164,8 @@ def score_notes_page(text: str) -> int:
     score += text.count("|") * 2
 
     words     = len(text.split())
-    num_count = len(re.findall(r'\d+', text))
-    if words > 30 and words > 0 and (num_count / words) > 0.5:
+    num_count = len(re.findall(r'\\\\d+', text))
+    if words > 30 and (num_count / words) > 0.5:
         score = int(score * 0.4)
 
     return score
@@ -172,6 +173,7 @@ def score_notes_page(text: str) -> int:
 
 # ── SMART PAGE SELECTOR ───────────────────────────────────────────
 def select_pages(page_texts: list, scorer_fn, char_limit: int, top_n: int = 20) -> str:
+    """Score all pages, take top N, re-sort into document order."""
     scored = []
     for page_num, text in enumerate(page_texts):
         score = scorer_fn(text)
@@ -187,9 +189,9 @@ def select_pages(page_texts: list, scorer_fn, char_limit: int, top_n: int = 20) 
         if len(result) + len(text) + 1 > char_limit:
             remaining = char_limit - len(result)
             if remaining > 800:
-                result += text[:remaining] + "\n"
+                result += text[:remaining] + "\\\\n"
             break
-        result += text + "\n"
+        result += text + "\\\\n"
 
     return result.strip()
 
@@ -243,30 +245,19 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
     contents   = await file.read()
     pdf_doc    = fitz.open(stream=contents, filetype="pdf")
     page_texts = []
-    # FIX 2 — OCR cap: only OCR up to MAX_OCR_PAGES image pages
-    # Prevents signature/letterhead pages from causing 200s timeout
-    ocr_count  = 0
 
     for page_num in range(len(pdf_doc)):
         page = pdf_doc[page_num]
         text = extract_page_text_structured(page)
-        if not text.strip() and ocr_count < MAX_OCR_PAGES:
-            # Only OCR pages that actually contain image blocks
-            page_dict        = page.get_text("dict")
-            has_image_blocks = any(
-                b.get("type") == 1 for b in page_dict.get("blocks", [])
-            )
-            if has_image_blocks:
-                # 1.5x is sufficient quality and ~40% faster than original 2x
-                pix  = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-                img  = Image.open(io.BytesIO(pix.tobytes("png")))
-                text = pytesseract.image_to_string(img, lang='eng').strip()
-                ocr_count += 1
+        if not text.strip():
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            text = pytesseract.image_to_string(img, lang='eng').strip()
         page_texts.append(text)
 
     pdf_doc.close()
 
-    full_text = "\n".join(page_texts)
+    full_text = "\\\\n".join(page_texts)
     if not full_text.strip():
         raise HTTPException(400, "No extractable text found in PDF.")
 
@@ -284,9 +275,9 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
     data_hint     = ""
 
     for doc_key, sections in doc_schemas.items():
-        desc = "\n".join([f'  "{s["key"]}": {s["title"]}' for s in sections])
-        schema_desc += f'\n{doc_key.upper()} section keys:\n{desc}\n'
-        data_hint   += f'    "{doc_key}": {{ "section_key": {{ "FY2024": {{ "Line Item": 1234.00 }} }} }},\n'
+        desc = "\\\\n".join([f'  "{s["key"]}": {s["title"]}' for s in sections])
+        schema_desc += f'\\\\n{doc_key.upper()} section keys:\\\\n{desc}\\\\n'
+        data_hint   += f'    "{doc_key}": {{ "section_key": {{ "FY2024": {{ "Line Item": 1234.00 }} }} }},\\\\n'
 
     # ── CALL 1 — Financial Data (P&L, BS, Cash Flow) ──────────────
     fin_prompt = f"""You are a senior financial analyst extraction engine specialising in Indian statutory audit reports (Schedule III format).
@@ -379,8 +370,7 @@ Document:
             ],
             model="llama-3.3-70b-versatile",
             temperature=0,
-            # FIX 3 — increased from 4000 to 8000 (fixes truncation on large PDFs)
-            max_tokens=8000,
+            max_tokens=4000,
             response_format={"type": "json_object"}
         )
         fin_parsed = json.loads(fin_response.choices[0].message.content)
@@ -444,6 +434,7 @@ Document:
     # ── Clean numeric values ──────────────────────────────────────
     def clean_val(v):
         try:
+            # Handle Indian number format: "1,26,44,429.00" → 12644429.00
             cleaned = str(v).replace(',', '').replace(' ', '').strip()
             return float(cleaned)
         except Exception:
@@ -483,7 +474,7 @@ Document:
             "table":  clean_table
         })
 
-    # ── Confidence scores ─────────────────────────────────────────
+    # ── Confidence scores (raw, no threshold logic) ───────────────
     raw_conf        = fin_parsed.get("confidence", {})
     item_confidence = {}
 
@@ -529,18 +520,14 @@ async def debug_extract(file: UploadFile = File(...)):
     pdf_doc    = fitz.open(stream=contents, filetype="pdf")
     page_texts = []
     page_data  = []
-    ocr_count  = 0
 
     for page_num in range(len(pdf_doc)):
         page = pdf_doc[page_num]
         text = extract_page_text_structured(page)
-        if not text.strip() and ocr_count < MAX_OCR_PAGES:
-            page_dict = page.get_text("dict")
-            if any(b.get("type") == 1 for b in page_dict.get("blocks", [])):
-                pix  = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-                img  = Image.open(io.BytesIO(pix.tobytes("png")))
-                text = pytesseract.image_to_string(img, lang='eng').strip()
-                ocr_count += 1
+        if not text.strip():
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            text = pytesseract.image_to_string(img, lang='eng').strip()
         page_texts.append(text)
         page_data.append({
             "page":            page_num + 1,
@@ -556,7 +543,6 @@ async def debug_extract(file: UploadFile = File(...)):
 
     return {
         "total_pages":          len(page_data),
-        "ocr_pages_used":       ocr_count,
         "page_scores":          sorted(page_data, key=lambda x: x["financial_score"], reverse=True),
         "financial_text_chars": len(fin_text),
         "notes_text_chars":     len(notes_text),
