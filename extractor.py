@@ -1,4 +1,4 @@
-# extractor.py — FIXED: Per-document extraction calls, doc-specific page scoring
+# extractor.py — HYBRID: Single combined call (fast) + targeted fallback for empty docs
 import fitz
 import io
 import os
@@ -13,9 +13,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
 from typing import Any
+import asyncio
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 app = FastAPI()
 
+class TimeoutMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        try:
+            return await asyncio.wait_for(call_next(request), timeout=150.0)
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                {"detail": "Extraction timed out. PDF may be too large or image-heavy."},
+                status_code=504
+            )
+
+app.add_middleware(TimeoutMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,11 +41,12 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
 client = Groq(api_key=GROQ_API_KEY)
 
-# ── TOKEN / CHAR LIMITS ───────────────────────────────────────────────────────
-# Each doc type now gets its OWN char budget (no sharing between P&L and BS)
-PER_DOC_CHAR_LIMIT = 10_000   # chars fed per doc-type extraction call
-NOTES_TEXT_LIMIT   = 8_000
-MAX_OUTPUT_TOKENS  = 8000     # llama-3.3-70b supports up to 8192 output tokens
+# ── LIMITS ────────────────────────────────────────────────────────────────────
+FINANCIAL_TEXT_LIMIT = 14_000   # Combined pass char limit (all docs together)
+PER_DOC_CHAR_LIMIT   = 10_000   # Fallback per-doc char limit
+NOTES_TEXT_LIMIT     = 8_000
+MAX_OUTPUT_TOKENS    = 8000     # llama-3.3-70b supports up to 8192
+MAX_OCR_PAGES        = 8        # Hard cap to prevent OCR timeout
 
 # ── KEYWORD SETS ─────────────────────────────────────────────────────────────
 FINANCIAL_KEYWORDS = [
@@ -44,7 +59,6 @@ FINANCIAL_KEYWORDS = [
     "intangible", "trade receivable", "advance", "prepaid", "inventory"
 ]
 
-# Doc-specific keyword sets for targeted page selection
 PNL_KEYWORDS = [
     "revenue", "sales", "income", "turnover", "other income",
     "expenses", "expenditure", "profit", "loss", "ebitda",
@@ -94,7 +108,6 @@ class ExtractResponse(BaseModel):
 
 # ── CLEAN NUMERIC VALUE ───────────────────────────────────────────────────────
 def clean_val(v):
-    """Remove Indian-format commas and convert to float."""
     try:
         return float(str(v).replace(',', '').replace(' ', '').strip())
     except Exception:
@@ -119,7 +132,6 @@ def detect_company_type(text: str) -> str:
 
 # ── TEXT EXTRACTION ───────────────────────────────────────────────────────────
 def extract_page_text_structured(page) -> str:
-    """Coordinate-sorted extraction — preserves table column alignment."""
     try:
         raw_dict  = page.get_text("dict")
         all_spans = []
@@ -152,7 +164,6 @@ def extract_page_text_structured(page) -> str:
 
 # ── PAGE SCORERS ──────────────────────────────────────────────────────────────
 def _base_financial_score(text: str, keywords: list) -> int:
-    """Shared scoring base: numbers + pipes + year hits + keyword hits."""
     score = 0
     lower = text.lower()
     score += len(INDIAN_NUMBER_RE.findall(text)) * 4
@@ -170,7 +181,6 @@ def _base_financial_score(text: str, keywords: list) -> int:
     if words > 80 and words > 0 and (num_count / words) < 0.05:
         score = int(score * 0.3)
     return score
-
 
 def score_pnl_page(text: str) -> int:
     return _base_financial_score(text, PNL_KEYWORDS)
@@ -203,8 +213,6 @@ def score_notes_page(text: str) -> int:
         score = int(score * 0.4)
     return score
 
-
-# Map doc key → its specific scorer
 DOC_SCORER_MAP = {
     "pnl": score_pnl_page,
     "bs":  score_bs_page,
@@ -212,7 +220,6 @@ DOC_SCORER_MAP = {
 }
 
 def get_doc_scorer(doc_key: str):
-    """Return doc-specific scorer, fallback to generic."""
     for key_fragment, scorer in DOC_SCORER_MAP.items():
         if key_fragment in doc_key.lower():
             return scorer
@@ -221,14 +228,13 @@ def get_doc_scorer(doc_key: str):
 
 # ── SMART PAGE SELECTOR ───────────────────────────────────────────────────────
 def select_pages(page_texts: list, scorer_fn, char_limit: int, top_n: int = 20) -> str:
-    """Score all pages, pick top N, re-sort into document order, concatenate."""
     scored = []
     for i, text in enumerate(page_texts):
         s = scorer_fn(text)
         if s > 0:
             scored.append((s, i, text))
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = sorted(scored[:top_n], key=lambda x: x[1])  # restore page order
+    top = sorted(scored[:top_n], key=lambda x: x[1])
 
     result = ""
     for _, _, text in top:
@@ -255,7 +261,7 @@ def compute_item_confidence(item_name: str, val: float, full_text: str, model_co
     return min(score, 100)
 
 
-# ── GROQ CALL WITH RATE-LIMIT RETRY ──────────────────────────────────────────
+# ── GROQ CALL WITH RETRY ──────────────────────────────────────────────────────
 def groq_call(messages: list, max_tokens: int = MAX_OUTPUT_TOKENS, retries: int = 2) -> dict:
     for attempt in range(retries + 1):
         try:
@@ -271,22 +277,27 @@ def groq_call(messages: list, max_tokens: int = MAX_OUTPUT_TOKENS, retries: int 
             err_str = str(e).lower()
             if ("rate_limit" in err_str or "429" in err_str) and attempt < retries:
                 wait_secs = 20 * (attempt + 1)
-                print(f"[Groq] Rate limit hit — waiting {wait_secs}s before retry {attempt + 1}...")
+                print(f"[Groq] Rate limit — waiting {wait_secs}s (attempt {attempt + 1})...")
                 time.sleep(wait_secs)
                 continue
             raise e
 
 
-# ── SINGLE-DOC EXTRACTION PROMPT ─────────────────────────────────────────────
-def build_doc_prompt(doc_key: str, sections: list, doc_text: str,
-                     company_type: str, detected_periods: list) -> str:
-    section_desc    = "\n".join([f'  "{s["key"]}": {s["title"]}' for s in sections])
-    periods_hint    = json.dumps(detected_periods) if detected_periods else '["FY2024","FY2023"]'
-    data_hint       = f'"{doc_key}": {{ "section_key": {{ "FY2024": {{ "Line Item": 1234.00 }} }} }}'
+# ── COMBINED PROMPT (primary call — all docs in one) ─────────────────────────
+def build_combined_prompt(doc_schemas: dict, financial_text: str,
+                           company_type: str, detected_periods: list) -> str:
+    doc_keys_json = json.dumps(list(doc_schemas.keys()))
+    schema_desc   = ""
+    data_hint     = ""
+    for doc_key, sections in doc_schemas.items():
+        desc = "\n".join([f'  "{s["key"]}": {s["title"]}' for s in sections])
+        schema_desc += f'\n{doc_key.upper()} section keys:\n{desc}\n'
+        data_hint   += f'    "{doc_key}": {{ "section_key": {{ "FY2024": {{ "Line Item": 1234.00 }} }} }},\n'
+
+    periods_hint = json.dumps(detected_periods)
 
     return f"""You are a senior financial analyst extraction engine specialising in Indian statutory audit reports (Schedule III format).
 Company Type Detected: {company_type}
-Document Type: {doc_key.upper()} only — extract ONLY {doc_key.upper()} data.
 Expected periods (already detected from PDF): {periods_hint}
 
 The document text has been extracted with table columns separated by " | ".
@@ -300,12 +311,12 @@ Return ONLY valid JSON:
   "all_periods": ["FY2024", "FY2023"],
   "confidence": {{ "Exact Item Name": 95 }},
   "data": {{
-    {data_hint}
-  }}
+{data_hint}  }}
 }}
 
-Section keys for {doc_key.upper()} (use EXACTLY these keys):
-{section_desc}
+The "data" object MUST contain keys for: {doc_keys_json}
+
+{schema_desc}
 
 CRITICAL EXTRACTION RULES (India Schedule III):
 
@@ -322,7 +333,6 @@ CRITICAL EXTRACTION RULES (India Schedule III):
    - READ EXACT VALUES FROM PDF. Match each digit character-by-character.
    - Indian format: "12,34,567.89" = 1234567.89 (NOT 123456789)
    - Remove commas ONLY: "1,26,44,429.00" → 12644429.00
-   - If decimal places differ (1.70 vs 1.72), re-check source PDF twice. Use EXACT source value.
    - Flag confidence < 70 for any digit misread risk.
 
 4. ASSET BREAKDOWN:
@@ -345,12 +355,11 @@ CRITICAL EXTRACTION RULES (India Schedule III):
 7. CASH FLOW MOVEMENT:
    - Cash Flow = Closing Balance MINUS Opening Balance (yearly movement)
    - NOT just closing balance alone.
-   - If movement data missing, extract opening and closing separately.
 
 8. CONFIDENCE SCORING:
-   - 90-100: Value clearly visible in table, exact match to source text
+   - 90-100: Value clearly visible, exact match
    - 70-89: Inferred or slightly unclear
-   - <70: Hallucinated or cannot verify in source
+   - <70: Cannot verify in source
 
 9. EDGE CASES:
    - "-", blank, "Nil", "N/A" → 0.0 (not null)
@@ -359,10 +368,51 @@ CRITICAL EXTRACTION RULES (India Schedule III):
 
 10. RETURN ONLY JSON. No markdown. No explanation. No code blocks.
 
-11. NO MATH EXPRESSIONS (CRITICAL): All values MUST be a single, final float number (e.g., 1500.0).
-    NEVER output mathematical expressions like "1000 + 200". Perform the math yourself and output only the final number.
+11. NO MATH EXPRESSIONS (CRITICAL): All values MUST be a single final float (e.g., 1500.0).
+    NEVER output expressions like "1000 + 200". Perform arithmetic yourself.
 
-Document text ({doc_key.upper()} section):
+Document:
+{financial_text}"""
+
+
+# ── TARGETED FALLBACK PROMPT (for empty docs after combined call) ─────────────
+def build_fallback_prompt(doc_key: str, sections: list, doc_text: str,
+                           company_type: str, detected_periods: list) -> str:
+    section_desc = "\n".join([f'  "{s["key"]}": {s["title"]}' for s in sections])
+    periods_hint = json.dumps(detected_periods)
+    data_hint    = f'"{doc_key}": {{ "section_key": {{ "FY2024": {{ "Line Item": 1234.00 }} }} }}'
+
+    return f"""You are a senior financial analyst extraction engine for Indian statutory audit reports (Schedule III).
+Company Type: {company_type}
+Document Type: {doc_key.upper()} ONLY — extract ONLY {doc_key.upper()} data.
+Expected periods: {periods_hint}
+
+Text format: columns separated by " | " — each row: Item Name | Note | VALUE_YEAR1 | VALUE_YEAR2
+
+Return ONLY valid JSON:
+{{
+  "company_name": "string",
+  "period": "FY2024",
+  "all_periods": ["FY2024", "FY2023"],
+  "confidence": {{ "Exact Item Name": 95 }},
+  "data": {{
+    {data_hint}
+  }}
+}}
+
+Section keys for {doc_key.upper()}:
+{section_desc}
+
+RULES:
+1. YEAR: First value column = most recent. Normalise → "FY20XX". Only create FY if actual data present.
+2. NUMBERS: Indian format "12,34,567.89" = 1234567.89. Remove commas. Output final float only.
+3. "-", blank, "Nil", "N/A" → 0.0
+4. NO MATH EXPRESSIONS — output only the final computed number.
+5. Keep item-level detail. Do NOT aggregate into totals unless source shows "Total X".
+6. CONFIDENCE: 90+ = clearly visible, 70-89 = inferred, <70 = uncertain.
+7. Return ONLY the JSON. No markdown. No explanation.
+
+Document text:
 {doc_text}"""
 
 
@@ -372,7 +422,6 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
     if not file.filename.endswith('.pdf'):
         raise HTTPException(400, "Only PDF files allowed")
 
-    # Parse *_schema form fields
     form_data   = await request.form()
     doc_schemas = {}
     for field_name, field_value in form_data.items():
@@ -389,18 +438,28 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
             "bs":  [{"key": "currentAssets", "title": "Current Assets"}]
         }
 
-    # ── Extract all page texts ────────────────────────────────────
+    # ── Extract all page texts with OCR cap ───────────────────────
     contents   = await file.read()
     pdf_doc    = fitz.open(stream=contents, filetype="pdf")
     page_texts = []
+    ocr_count  = 0
 
     for page_num in range(len(pdf_doc)):
         page = pdf_doc[page_num]
         text = extract_page_text_structured(page)
-        if not text.strip():
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            text = pytesseract.image_to_string(img, lang='eng').strip()
+
+        if not text.strip() and ocr_count < MAX_OCR_PAGES:
+            page_dict        = page.get_text("dict")
+            has_image_blocks = any(
+                b.get("type") == 1 for b in page_dict.get("blocks", [])
+            )
+            if has_image_blocks:
+                pix  = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                img  = Image.open(io.BytesIO(pix.tobytes("png")))
+                text = pytesseract.image_to_string(img, lang='eng').strip()
+                ocr_count += 1
+                print(f"[OCR] Page {page_num + 1} OCR'd ({ocr_count}/{MAX_OCR_PAGES})")
+
         page_texts.append(text)
 
     pdf_doc.close()
@@ -411,7 +470,7 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
 
     company_type = detect_company_type(full_text)
 
-    # ── Pre-detect fiscal year periods from full text ─────────────
+    # ── Pre-detect fiscal year periods ────────────────────────────
     raw_hits = re.findall(
         r'FY\s*(\d{2,4})|(?:20(\d{2}))[-–](?:20)?(\d{2,4})',
         full_text
@@ -431,33 +490,89 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
     if not detected_periods:
         detected_periods = ["FY2024", "FY2023"]
 
-    # ── PER-DOC extraction ────────────────────────────────────────
-    # KEY FIX: each doc type gets its own page selection + its own LLM call
-    # This prevents BS pages from crowding out P&L pages in a shared char budget
+    # ── PASS 1: Single combined call (fast, within TPM) ───────────
+    # Uses generic financial scorer — good enough for normal PDFs
+    financial_text = select_pages(page_texts, score_financial_page,
+                                  FINANCIAL_TEXT_LIMIT, top_n=20)
+
     final_data     = {}
     all_confidence = {}
     company_name   = "Unknown"
-    primary_period = detected_periods[0] if detected_periods else "FY2024"
+    primary_period = detected_periods[0]
     all_periods    = list(detected_periods)
 
-    for doc_key, sections in doc_schemas.items():
-        print(f"[Extract] Processing doc: {doc_key}")
+    combined_parsed = {}
+    try:
+        combined_parsed = groq_call(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are a strict financial OCR parser for Indian statutory reports "
+                        f"({company_type}). Extract all document types. Return only valid JSON."
+                    )
+                },
+                {"role": "user", "content": build_combined_prompt(
+                    doc_schemas, financial_text, company_type, detected_periods
+                )}
+            ],
+            max_tokens=MAX_OUTPUT_TOKENS
+        )
+    except Exception as e:
+        print(f"[Extract] Combined call failed: {str(e)}")
+        combined_parsed = {}
 
-        # Use doc-specific scorer to pick the most relevant pages for THIS doc
+    # Parse combined result
+    if combined_parsed.get("company_name"):
+        company_name = combined_parsed["company_name"]
+    if combined_parsed.get("period"):
+        primary_period = combined_parsed["period"]
+    if combined_parsed.get("all_periods"):
+        all_periods = combined_parsed["all_periods"]
+
+    raw_conf = combined_parsed.get("confidence", {})
+
+    for doc_key, sections in doc_schemas.items():
+        raw_doc = combined_parsed.get("data", {}).get(doc_key, {})
+        final_data[doc_key] = {}
+        for sec_key, periods in raw_doc.items():
+            final_data[doc_key][sec_key] = {}
+            if isinstance(periods, dict):
+                for period, items in periods.items():
+                    if isinstance(items, dict):
+                        final_data[doc_key][sec_key][period] = {
+                            k: clean_val(v) for k, v in items.items()
+                        }
+        # Gather confidence
+        for sec_data in final_data[doc_key].values():
+            for period_data in sec_data.values():
+                for item_name, item_val in period_data.items():
+                    if item_name not in all_confidence:
+                        all_confidence[item_name] = compute_item_confidence(
+                            item_name, item_val, full_text, raw_conf
+                        )
+
+    # ── PASS 2: Targeted fallback for any doc that came back empty ─
+    # Only triggered if combined call missed a doc (large/complex PDFs)
+    # Uses doc-specific page scorer for better page selection
+    empty_docs = [dk for dk, dd in final_data.items() if not dd]
+
+    if empty_docs:
+        print(f"[Extract] Pass 1 missed: {empty_docs} — running targeted fallback calls")
+        # Respect TPM — wait before making more calls
+        time.sleep(5)
+
+    for doc_key in empty_docs:
+        sections = doc_schemas[doc_key]
         scorer   = get_doc_scorer(doc_key)
         doc_text = select_pages(page_texts, scorer, PER_DOC_CHAR_LIMIT, top_n=18)
 
-        # Fallback: if doc-specific scorer found nothing, use generic
         if not doc_text.strip():
-            print(f"[Extract] {doc_key}: doc-specific scorer empty, falling back to generic")
-            doc_text = select_pages(page_texts, score_financial_page, PER_DOC_CHAR_LIMIT, top_n=18)
-
+            doc_text = select_pages(page_texts, score_financial_page,
+                                    PER_DOC_CHAR_LIMIT, top_n=18)
         if not doc_text.strip():
-            print(f"[Extract] {doc_key}: no relevant pages found, skipping")
-            final_data[doc_key] = {}
+            print(f"[Extract] {doc_key}: no relevant pages found even in fallback")
             continue
-
-        prompt = build_doc_prompt(doc_key, sections, doc_text, company_type, detected_periods)
 
         try:
             parsed = groq_call(
@@ -465,34 +580,22 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
                     {
                         "role": "system",
                         "content": (
-                            f"You are a strict financial OCR parser for Indian statutory reports "
-                            f"({company_type}). Extract ONLY {doc_key.upper()} data. "
-                            f"Return only valid JSON."
+                            f"You are a strict financial OCR parser ({company_type}). "
+                            f"Extract ONLY {doc_key.upper()} data. Return only valid JSON."
                         )
                     },
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": build_fallback_prompt(
+                        doc_key, sections, doc_text, company_type, detected_periods
+                    )}
                 ],
                 max_tokens=MAX_OUTPUT_TOKENS
             )
         except Exception as e:
-            print(f"[Extract] {doc_key} extraction failed: {str(e)}")
-            final_data[doc_key] = {}
+            print(f"[Extract] Fallback for {doc_key} failed: {str(e)}")
             continue
 
-        # Update global meta from first successful parse
-        if company_name == "Unknown" and parsed.get("company_name"):
-            company_name = parsed["company_name"]
-        if parsed.get("period"):
-            primary_period = parsed["period"]
-        if parsed.get("all_periods"):
-            for p in parsed["all_periods"]:
-                if p not in all_periods:
-                    all_periods.append(p)
-
-        # Clean and store this doc's data
         raw_doc_data        = parsed.get("data", {}).get(doc_key, {})
         final_data[doc_key] = {}
-
         for sec_key, periods in raw_doc_data.items():
             final_data[doc_key][sec_key] = {}
             if isinstance(periods, dict):
@@ -502,18 +605,16 @@ async def extract_pdf(request: Request, file: UploadFile = File(...)):
                             k: clean_val(v) for k, v in items.items()
                         }
 
-        # Merge confidence scores
-        raw_conf = parsed.get("confidence", {})
+        fb_conf = parsed.get("confidence", {})
         for sec_data in final_data[doc_key].values():
             for period_data in sec_data.values():
                 for item_name, item_val in period_data.items():
                     if item_name not in all_confidence:
                         all_confidence[item_name] = compute_item_confidence(
-                            item_name, item_val, full_text, raw_conf
+                            item_name, item_val, full_text, fb_conf
                         )
 
-        # Respect Groq TPM between calls (2s gap)
-        time.sleep(2)
+        time.sleep(3)  # TPM gap between fallback calls
 
     # ── Notes extraction ──────────────────────────────────────────
     notes_text   = select_pages(page_texts, score_notes_page, NOTES_TEXT_LIMIT, top_n=12)
@@ -537,14 +638,10 @@ Return ONLY valid JSON:
 }}
 
 Rules:
-- Extract EVERY numbered note and named schedule found in the document.
-- "number": note number as string ("1", "2", "2a", etc.)
-- "title": the heading of the note
-- "text": policy or qualitative explanation — empty string if none
-- "table": array of line items with per-year values. [] if the note has no table.
-- Remove all commas from numbers: "1,26,44,429.00" → 12644429.00
-- Use "FY20XX" format for all year keys
-- NO MATH EXPRESSIONS: All values must be final floats. Do not output "100+20".
+- Extract EVERY numbered note and named schedule found.
+- Remove commas from numbers: "1,26,44,429.00" → 12644429.00
+- Use "FY20XX" format for all year keys.
+- NO MATH EXPRESSIONS — all values must be final floats.
 - Return ONLY the JSON. No markdown. No explanation.
 
 Document:
@@ -603,7 +700,7 @@ def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "llama-3.3-70b-versatile", "mode": "per-doc-extraction"}
+    return {"status": "ok", "model": "llama-3.3-70b-versatile", "mode": "hybrid-extraction"}
 
 @app.get("/ping")
 def ping():
@@ -615,40 +712,45 @@ async def debug_extract(file: UploadFile = File(...)):
     pdf_doc    = fitz.open(stream=contents, filetype="pdf")
     page_texts = []
     page_data  = []
+    ocr_count  = 0
 
     for page_num in range(len(pdf_doc)):
         page = pdf_doc[page_num]
         text = extract_page_text_structured(page)
-        if not text.strip():
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            text = pytesseract.image_to_string(img, lang='eng').strip()
+        if not text.strip() and ocr_count < MAX_OCR_PAGES:
+            page_dict = page.get_text("dict")
+            if any(b.get("type") == 1 for b in page_dict.get("blocks", [])):
+                pix  = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                img  = Image.open(io.BytesIO(pix.tobytes("png")))
+                text = pytesseract.image_to_string(img, lang='eng').strip()
+                ocr_count += 1
         page_texts.append(text)
         page_data.append({
             "page":        page_num + 1,
             "pnl_score":   score_pnl_page(text),
             "bs_score":    score_bs_page(text),
             "cf_score":    score_cf_page(text),
+            "fin_score":   score_financial_page(text),
             "notes_score": score_notes_page(text),
             "chars":       len(text),
             "preview":     text[:120]
         })
 
-    pnl_text   = select_pages(page_texts, score_pnl_page,   PER_DOC_CHAR_LIMIT, 18)
-    bs_text    = select_pages(page_texts, score_bs_page,    PER_DOC_CHAR_LIMIT, 18)
-    cf_text    = select_pages(page_texts, score_cf_page,    PER_DOC_CHAR_LIMIT, 18)
-    notes_text = select_pages(page_texts, score_notes_page, NOTES_TEXT_LIMIT,   12)
+    fin_text   = select_pages(page_texts, score_financial_page, FINANCIAL_TEXT_LIMIT, 20)
+    pnl_text   = select_pages(page_texts, score_pnl_page,       PER_DOC_CHAR_LIMIT,   18)
+    bs_text    = select_pages(page_texts, score_bs_page,        PER_DOC_CHAR_LIMIT,   18)
+    notes_text = select_pages(page_texts, score_notes_page,     NOTES_TEXT_LIMIT,     12)
     pdf_doc.close()
 
     return {
         "total_pages":      len(page_data),
-        "page_scores":      sorted(page_data, key=lambda x: x["pnl_score"] + x["bs_score"], reverse=True)[:20],
-        "pnl_text_chars":   len(pnl_text),
-        "bs_text_chars":    len(bs_text),
-        "cf_text_chars":    len(cf_text),
-        "notes_text_chars": len(notes_text),
-        "pnl_preview":      pnl_text[:2000],
-        "bs_preview":       bs_text[:2000],
-        "cf_preview":       cf_text[:1000],
-        "notes_preview":    notes_text[:1000]
+        "ocr_pages_used":   ocr_count,
+        "page_scores":      sorted(page_data, key=lambda x: x["fin_score"], reverse=True)[:20],
+        "combined_chars":   len(fin_text),
+        "pnl_chars":        len(pnl_text),
+        "bs_chars":         len(bs_text),
+        "notes_chars":      len(notes_text),
+        "combined_preview": fin_text[:2000],
+        "pnl_preview":      pnl_text[:1000],
+        "bs_preview":       bs_text[:1000],
     }
